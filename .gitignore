@@ -1,0 +1,40 @@
+# Python
+.venv/
+venv/
+env/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+
+# Data / outputs
+data/
+datasets/
+norm_stats/
+outputs/
+SimVLA/runs/
+runs/
+logs/
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/

@@ -1,0 +1,108 @@
+# SimVLA: A Simple VLA Baseline for Robotic Manipulation
+
+| **Paper** | **Website** | **Model & Data** |
+| :------------------: | :-----------------------: | :---------------------: |
+| [![Paper](https://img.shields.io/badge/Paper-A42C25?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2602.18224) | [![Website](https://img.shields.io/badge/Project%20Page-181717?style=for-the-badge&logo=githubpages&logoColor=white)](https://frontierrobo.github.io/SimVLA/) | [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-FFBA00?style=for-the-badge&logo=huggingface&logoColor=white)](https://huggingface.co/collections/YuankaiLuo/simvla) |
+
+A simple and efficient Vision-Language-Action (VLA) model for robot manipulation tasks.
+
+<img width="506" height="796" alt="image" src="https://github.com/user-attachments/assets/7ffb8969-aa4f-4bcc-8c38-33d5e7da4b25" />
+
+## Installation
+
+```bash
+conda create -n simvla python=3.10 -y
+conda activate simvla
+
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install transformers>=4.57.0
+pip install peft accelerate fastapi tensorboard uvicorn json_numpy safetensors scipy einops timm mmengine pyarrow h5py mediapy num2words av wandb websockets msgpack_numpy
+pip install flash-attn==2.5.6 --no-build-isolation
+pip install tensorflow tensorflow-datasets
+```
+
+> Important: Use `transformers>=4.57.0`.
+
+## Training (LIBERO Dataset)
+
+### 1. Prepare LIBERO Dataset
+
+Download [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) dataset, and place it in `./datasets/metas/`.
+
+### 2. Create Training Metadata
+
+```bash
+python create_libero_meta.py \
+    --data_dir ./datasets/metas \
+    --subsets libero_10 libero_goal libero_object libero_spatial \
+    --output ./datasets/metas/libero_train.json
+```
+
+### 3. Compute Normalization Statistics
+
+```bash
+python compute_libero_norm_stats.py \
+    --data_dir ./datasets/metas \
+    --subsets libero_10 libero_goal libero_object libero_spatial \
+    --output ./norm_stats/libero_norm.json
+```
+
+### 4. Start Training
+
+**Small Model Configuration:**
+```bash
+bash train_smolvlm_small.sh
+```
+
+**Large Model Configuration:**
+```bash
+bash train_smolvlm_large.sh
+```
+
+## Training on the local SO-101 dataset
+
+From this repository, using the workspace Conda environment:
+
+```bash
+conda run -n vla bash train_smolvlm_so101.sh
+```
+
+The launcher reads `../data/so101_counterfactual`, uses only its train split,
+and predicts the next 10 absolute joint commands from two camera views.
+
+Run a checkpoint in SO101-Nexus and save a rollout video:
+
+```bash
+conda run -n vla python evaluate_so101.py \
+    --checkpoint runs/simvla_so101_small/ckpt-10000
+```
+
+### 5. Evaluation
+
+```bash
+cd evaluation/libero
+```
+
+### 6. Results
+
+<img width="506" height="1220" alt="image" src="https://github.com/user-attachments/assets/6ee1cd5e-42c5-4cf7-9cce-6dc04c1a215f" />
+
+## Model Architecture
+
+- **Vision-Language Backbone**: SmolVLM-500M-Instruct (576 hidden dim)
+- **Action Transformer**: Configurable depth and width
+  - Small: 768 hidden, 12 layers, 12 heads
+  - Large: 1024 hidden, 24 layers, 16 heads
+
+## Reference
+
+If you find our codes useful, please consider citing our work
+
+```
+@article{luo2026simvla,
+  title={SimVLA: A Simple VLA Baseline for Robotic Manipulation},
+  author={Luo, Yuankai and Chen, Woping and Liang, Tong and Wang, Baiqiao and Li, Zhenguo},
+  journal={arXiv preprint arXiv:2602.18224},
+  year={2026}
+}
+```

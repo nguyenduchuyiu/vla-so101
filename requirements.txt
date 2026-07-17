@@ -1,0 +1,3 @@
+# SmolVLM dependencies
+num2words
+flash-attn>=2.5.0
