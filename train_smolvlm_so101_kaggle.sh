@@ -13,7 +13,7 @@ LEARNING_RATE=${LEARNING_RATE:-5e-5}
 LEARNING_COEF=${LEARNING_COEF:-0.1}
 SMOLVLM_MODEL_PATH=${SMOLVLM_MODEL_PATH:-HuggingFaceTB/SmolVLM-500M-Instruct}
 SO101_DATA_DIR=${SO101_DATA_DIR:-../data/so101_counterfactual_observable}
-TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./datasets/metas/so101_observable_train.json}
+TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./simvla_datasets/metas/so101_observable_train.json}
 NORM_STATS_PATH=${NORM_STATS_PATH:-./norm_stats/so101_observable_norm.json}
 
 export CUDA_VISIBLE_DEVICES=0,1

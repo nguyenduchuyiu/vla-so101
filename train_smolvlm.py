@@ -262,7 +262,9 @@ def main(args):
         os.environ["WANDB_API_KEY"] = wandb_api_key
 
     # Accelerator setup
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    # Reentrant gradient checkpointing and DDP's unused-parameter traversal can
+    # install overlapping autograd hooks on the same VLM parameter.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         log_with=log_with,
         project_dir=output_dir,
@@ -368,9 +370,13 @@ def main(args):
         model.vlm.requires_grad_(False)
         logger.info("SmolVLM backbone is frozen (no gradients or optimizer state)")
     elif args.gradient_checkpointing:
-        model.vlm.gradient_checkpointing_enable()
+        model.vlm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
         model.vlm.config.use_cache = False
-        logger.info("SmolVLM backbone is trainable with gradient checkpointing")
+        model.vlm.config.text_config.use_cache = False
+        model.vlm.model.text_model.config.use_cache = False
+        logger.info("SmolVLM backbone is trainable with non-reentrant gradient checkpointing")
 
     # Build processor
     processor = SmolVLMVLAProcessor.from_pretrained(args.smolvlm_model_path)
