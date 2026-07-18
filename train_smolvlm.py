@@ -344,11 +344,14 @@ def main(args):
         logger.info(f"  num_actions: {args.num_actions}")
         logger.info(f"  use_adaln: {args.use_adaln}")
         
-        vlm_dtype = {
+        mixed_precision_dtype = {
             "bf16": "bfloat16",
             "fp16": "float16",
             "no": "float32",
         }[accelerator.mixed_precision]
+        # Trainable FP16 leaf parameters are incompatible with GradScaler's
+        # unscale step. Keep FP32 master weights and let autocast run FP16 ops.
+        vlm_dtype = mixed_precision_dtype if args.freeze_vlm else "float32"
         config = SmolVLMVLAConfig(
             smolvlm_model_path=args.smolvlm_model_path,
             vlm_dtype=vlm_dtype,
@@ -369,14 +372,19 @@ def main(args):
     if args.freeze_vlm:
         model.vlm.requires_grad_(False)
         logger.info("SmolVLM backbone is frozen (no gradients or optimizer state)")
-    elif args.gradient_checkpointing:
-        model.vlm.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-        model.vlm.config.use_cache = False
-        model.vlm.config.text_config.use_cache = False
-        model.vlm.model.text_model.config.use_cache = False
-        logger.info("SmolVLM backbone is trainable with non-reentrant gradient checkpointing")
+    else:
+        # Also fixes checkpoints whose saved config previously requested FP16.
+        model.vlm.float()
+        model.config.vlm_dtype = "float32"
+        logger.info("SmolVLM trainable parameters kept in FP32 for AMP")
+        if args.gradient_checkpointing:
+            model.vlm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            model.vlm.config.use_cache = False
+            model.vlm.config.text_config.use_cache = False
+            model.vlm.model.text_model.config.use_cache = False
+            logger.info("SmolVLM backbone uses non-reentrant gradient checkpointing")
 
     # Build processor
     processor = SmolVLMVLAProcessor.from_pretrained(args.smolvlm_model_path)
