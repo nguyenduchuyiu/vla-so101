@@ -16,7 +16,7 @@ conda activate simvla
 
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install transformers>=4.57.0
-pip install peft accelerate fastapi tensorboard uvicorn json_numpy safetensors scipy einops timm mmengine pyarrow h5py mediapy num2words av wandb websockets msgpack_numpy
+pip install peft==0.17.1 accelerate fastapi tensorboard uvicorn json_numpy safetensors scipy einops timm mmengine pyarrow h5py mediapy num2words av wandb websockets msgpack_numpy
 pip install flash-attn==2.5.6 --no-build-isolation
 pip install tensorflow tensorflow-datasets
 ```
