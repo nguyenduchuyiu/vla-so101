@@ -376,6 +376,9 @@ def main(args):
         # Also fixes checkpoints whose saved config previously requested FP16.
         model.vlm.float()
         model.config.vlm_dtype = "float32"
+        # SimVLA consumes hidden states, not vocabulary logits. Leaving this
+        # unused head trainable makes DDP wait for a gradient that never exists.
+        model.vlm.lm_head.requires_grad_(False)
         logger.info("SmolVLM trainable parameters kept in FP32 for AMP")
         if args.gradient_checkpointing:
             model.vlm.gradient_checkpointing_enable(
