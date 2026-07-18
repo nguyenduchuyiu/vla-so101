@@ -14,6 +14,8 @@ def main() -> None:
     parser.add_argument("--data_dir", type=Path, required=True)
     parser.add_argument("--meta_output", type=Path, required=True)
     parser.add_argument("--stats_output", type=Path, required=True)
+    parser.add_argument("--episode_index", type=int,
+                        help="Write metadata for one episode while keeping full-train stats")
     args = parser.parse_args()
 
     root = args.data_dir.resolve()
@@ -35,13 +37,17 @@ def main() -> None:
             raise ValueError(f"Invalid state/action shape in {episode_path}")
         states.append(state)
         actions.append(action)
-        datalist.append(
-            {
-                "path": str(episode_path),
-                "episode_index": record["episode_index"],
-                "language_instruction": record["language_instruction"],
-            }
-        )
+        if args.episode_index is None or record["episode_index"] == args.episode_index:
+            datalist.append(
+                {
+                    "path": str(episode_path),
+                    "episode_index": record["episode_index"],
+                    "language_instruction": record["language_instruction"],
+                }
+            )
+
+    if not datalist:
+        raise ValueError(f"Episode {args.episode_index} is not in the train split")
 
     state = np.concatenate(states).astype(np.float64)
     action = np.concatenate(actions).astype(np.float64)
@@ -73,7 +79,7 @@ def main() -> None:
         "metadata": {
             "data_dir": str(root),
             "split": "train",
-            "num_episodes": len(datalist),
+            "num_episodes": len(train_records),
             "num_steps": len(state),
             "state_dim": 6,
             "action_dim": 6,
@@ -84,7 +90,10 @@ def main() -> None:
     args.stats_output.parent.mkdir(parents=True, exist_ok=True)
     args.meta_output.write_text(json.dumps(meta, indent=2) + "\n")
     args.stats_output.write_text(json.dumps(stats, indent=2) + "\n")
-    print(f"prepared {len(datalist)} train episodes / {len(state)} frames")
+    print(
+        f"prepared metadata for {len(datalist)} episode(s); "
+        f"stats from {len(train_records)} episodes / {len(state)} frames"
+    )
 
 
 if __name__ == "__main__":

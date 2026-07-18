@@ -159,6 +159,8 @@ def get_args_parser():
                         help="Number of attention heads")
     parser.add_argument("--freeze_vlm", action="store_true", default=False,
                         help="Keep the SmolVLM backbone permanently frozen")
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=False,
+                        help="Checkpoint VLM activations to reduce training memory")
 
     return parser
 
@@ -282,6 +284,7 @@ def main(args):
         "hidden_size": args.hidden_size,
         "depth": args.depth,
         "use_adaln": args.use_adaln,
+        "gradient_checkpointing": args.gradient_checkpointing,
     }
     
     if use_wandb:
@@ -364,6 +367,10 @@ def main(args):
     if args.freeze_vlm:
         model.vlm.requires_grad_(False)
         logger.info("SmolVLM backbone is frozen (no gradients or optimizer state)")
+    elif args.gradient_checkpointing:
+        model.vlm.gradient_checkpointing_enable()
+        model.vlm.config.use_cache = False
+        logger.info("SmolVLM backbone is trainable with gradient checkpointing")
 
     # Build processor
     processor = SmolVLMVLAProcessor.from_pretrained(args.smolvlm_model_path)
@@ -409,7 +416,10 @@ def main(args):
     
     global_step, t0 = start_step, time.time()
     logger.info(f"🚀 Start SmolVLM-VLA training for {args.iters} iterations")
-    logger.info(f"   world_size={accelerator.num_processes}")
+    logger.info(
+        f"   world_size={accelerator.num_processes} "
+        f"global_batch_size={args.batch_size * accelerator.num_processes}"
+    )
 
     for batch in train_dataloader:
         # Encode language
@@ -452,13 +462,18 @@ def main(args):
         
         # Checkpointing
         global_step += 1
+        should_save = global_step == args.iters or global_step % args.save_interval == 0
+        if should_save:
+            accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            if global_step == args.iters or global_step % args.save_interval == 0:
+            if should_save:
                 save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
                 accelerator.print(f"💾 Saving model to {save_dir}")
                 accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
                 with open(os.path.join(save_dir, "state.json"), "w") as f:
                     json.dump({"global_step": global_step}, f)
+        if should_save:
+            accelerator.wait_for_everyone()
                     
         if global_step >= args.iters:
             break
