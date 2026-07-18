@@ -1,3 +1,4 @@
 # SmolVLM dependencies
 num2words
+peft>=0.14.0,<1.0
 flash-attn>=2.5.0

@@ -10,7 +10,10 @@ RESUME_CKPT=${3:-""}
 ITERS=${ITERS:-50000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
 LEARNING_RATE=${LEARNING_RATE:-5e-5}
-LEARNING_COEF=${LEARNING_COEF:-0.1}
+LEARNING_COEF=${LEARNING_COEF:-1.0}
+LORA_RANK=${LORA_RANK:-16}
+LORA_ALPHA=${LORA_ALPHA:-32}
+LORA_DROPOUT=${LORA_DROPOUT:-0.05}
 SMOLVLM_MODEL_PATH=${SMOLVLM_MODEL_PATH:-HuggingFaceTB/SmolVLM-500M-Instruct}
 SO101_DATA_DIR=${SO101_DATA_DIR:-../data/so101_counterfactual_observable}
 TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./simvla_datasets/metas/so101_observable_train.json}
@@ -37,6 +40,9 @@ ARGS="--output_dir ${OUTPUT_DIR} \
     --batch_size ${BATCH_SIZE} \
     --learning_rate ${LEARNING_RATE} \
     --learning_coef ${LEARNING_COEF} \
+    --lora_rank ${LORA_RANK} \
+    --lora_alpha ${LORA_ALPHA} \
+    --lora_dropout ${LORA_DROPOUT} \
     --num_actions 10 \
     --num_views 2 \
     --iters ${ITERS} \

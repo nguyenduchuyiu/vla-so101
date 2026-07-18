@@ -161,6 +161,10 @@ def get_args_parser():
                         help="Keep the SmolVLM backbone permanently frozen")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False,
                         help="Checkpoint VLM activations to reduce training memory")
+    parser.add_argument("--lora_rank", type=int, default=0,
+                        help="LoRA rank for VLM q/v projections; 0 disables LoRA")
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
 
     return parser
 
@@ -177,7 +181,8 @@ def set_seed(seed: int):
 
 def build_optimizer(model: SmolVLMVLA, lr: float, weight_decay: float, betas=(0.9, 0.95), lr_coef_vlm=1.0):
     """Build optimizer with separate param groups."""
-    vlm_params = list(model.vlm.parameters())
+    all_vlm_params = list(model.vlm.parameters())
+    vlm_params = [p for p in all_vlm_params if p.requires_grad]
     
     # Get action output params based on mode
     if hasattr(model.transformer, 'final_layer'):
@@ -185,8 +190,10 @@ def build_optimizer(model: SmolVLMVLA, lr: float, weight_decay: float, betas=(0.
     else:
         action_params = list(model.transformer.action_decoder.parameters()) + list(model.transformer.action_encoder.parameters())
     
-    exclude = set(map(id, vlm_params + action_params))
-    transformer_core_params = [p for p in model.parameters() if id(p) not in exclude]
+    exclude = set(map(id, all_vlm_params + action_params))
+    transformer_core_params = [
+        p for p in model.parameters() if id(p) not in exclude and p.requires_grad
+    ]
     
     param_groups = [
         {"name": "vlm", "params": vlm_params, "lr": 0.0, "weight_decay": weight_decay},
@@ -250,6 +257,8 @@ def update_group_lrs(optim, step, args):
 # ============================================================
 def main(args):
     output_dir = Path(args.output_dir)
+    if args.freeze_vlm and args.lora_rank > 0:
+        raise ValueError("--freeze_vlm and --lora_rank cannot be used together")
     
     # WandB setup
     wandb_api_key = os.environ.get("WANDB_API_KEY") or args.wandb_api_key
@@ -287,6 +296,9 @@ def main(args):
         "depth": args.depth,
         "use_adaln": args.use_adaln,
         "gradient_checkpointing": args.gradient_checkpointing,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
     }
     
     if use_wandb:
@@ -320,6 +332,12 @@ def main(args):
     if load_path and os.path.isdir(load_path) and os.path.exists(os.path.join(load_path, "model.safetensors")):
         logger.info(f"Loading SmolVLM-VLA from checkpoint: {load_path}")
         model = SmolVLMVLA.from_pretrained(load_path)
+
+        checkpoint_lora_rank = getattr(model.config, "lora_rank", 0)
+        if args.lora_rank != checkpoint_lora_rank:
+            raise ValueError(
+                f"Checkpoint lora_rank={checkpoint_lora_rank}, got --lora_rank={args.lora_rank}"
+            )
         
         if args.action_mode != model.action_mode:
             logger.warning(f"Overriding model action_mode from '{model.action_mode}' to '{args.action_mode}'")
@@ -351,10 +369,17 @@ def main(args):
         }[accelerator.mixed_precision]
         # Trainable FP16 leaf parameters are incompatible with GradScaler's
         # unscale step. Keep FP32 master weights and let autocast run FP16 ops.
-        vlm_dtype = mixed_precision_dtype if args.freeze_vlm else "float32"
+        vlm_dtype = (
+            mixed_precision_dtype
+            if args.freeze_vlm or args.lora_rank > 0
+            else "float32"
+        )
         config = SmolVLMVLAConfig(
             smolvlm_model_path=args.smolvlm_model_path,
             vlm_dtype=vlm_dtype,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
             hidden_size=args.hidden_size,
             depth=args.depth,
             num_heads=args.num_heads,
@@ -372,6 +397,13 @@ def main(args):
     if args.freeze_vlm:
         model.vlm.requires_grad_(False)
         logger.info("SmolVLM backbone is frozen (no gradients or optimizer state)")
+    elif args.lora_rank > 0:
+        trainable_vlm = sum(p.numel() for p in model.vlm.parameters() if p.requires_grad)
+        total_vlm = sum(p.numel() for p in model.vlm.parameters())
+        logger.info(
+            f"SmolVLM LoRA trainable parameters: {trainable_vlm:,}/{total_vlm:,} "
+            f"({100 * trainable_vlm / total_vlm:.3f}%)"
+        )
     else:
         # Also fixes checkpoints whose saved config previously requested FP16.
         model.vlm.float()
@@ -380,14 +412,14 @@ def main(args):
         # unused head trainable makes DDP wait for a gradient that never exists.
         model.vlm.lm_head.requires_grad_(False)
         logger.info("SmolVLM trainable parameters kept in FP32 for AMP")
-        if args.gradient_checkpointing:
-            model.vlm.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-            model.vlm.config.use_cache = False
-            model.vlm.config.text_config.use_cache = False
-            model.vlm.model.text_model.config.use_cache = False
-            logger.info("SmolVLM backbone uses non-reentrant gradient checkpointing")
+    if not args.freeze_vlm and args.gradient_checkpointing:
+        model.vlm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        model.vlm.config.use_cache = False
+        model.vlm.config.text_config.use_cache = False
+        model.vlm.model.text_model.config.use_cache = False
+        logger.info("SmolVLM backbone uses non-reentrant gradient checkpointing")
 
     # Build processor
     processor = SmolVLMVLAProcessor.from_pretrained(args.smolvlm_model_path)

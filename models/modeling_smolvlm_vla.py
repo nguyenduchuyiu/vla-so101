@@ -80,6 +80,22 @@ class SmolVLMVLA(PreTrainedModel):
             dtype=vlm_dtype,
             trust_remote_code=True,
         )
+        if config.lora_rank > 0:
+            from peft import LoraConfig, get_peft_model
+
+            peft_model = get_peft_model(
+                self.vlm,
+                LoraConfig(
+                    r=config.lora_rank,
+                    lora_alpha=config.lora_alpha,
+                    lora_dropout=config.lora_dropout,
+                    target_modules=["q_proj", "v_proj"],
+                    bias="none",
+                ),
+            )
+            # SimVLA calls the VLM's vision/text submodules directly. Keep the
+            # injected LoRA layers without PEFT's additional outer wrapper.
+            self.vlm = peft_model.get_base_model()
         self.vlm_processor = AutoProcessor.from_pretrained(
             config.smolvlm_model_path,
             trust_remote_code=True,
