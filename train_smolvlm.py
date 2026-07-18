@@ -29,7 +29,7 @@ import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from datasets import create_smolvlm_dataloader
+from simvla_datasets import create_smolvlm_dataloader
 from models.modeling_smolvlm_vla import SmolVLMVLA
 from models.processing_smolvlm_vla import SmolVLMVLAProcessor
 

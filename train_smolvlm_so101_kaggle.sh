@@ -11,9 +11,10 @@ ITERS=${ITERS:-50000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
 LEARNING_RATE=${LEARNING_RATE:-5e-5}
 LEARNING_COEF=${LEARNING_COEF:-0.1}
-SO101_DATA_DIR=${SO101_DATA_DIR:-../data/so101_counterfactual}
-TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./datasets/metas/so101_train.json}
-NORM_STATS_PATH=${NORM_STATS_PATH:-./norm_stats/so101_norm.json}
+SMOLVLM_MODEL_PATH=${SMOLVLM_MODEL_PATH:-HuggingFaceTB/SmolVLM-500M-Instruct}
+SO101_DATA_DIR=${SO101_DATA_DIR:-../data/so101_counterfactual_observable}
+TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./datasets/metas/so101_observable_train.json}
+NORM_STATS_PATH=${NORM_STATS_PATH:-./norm_stats/so101_observable_norm.json}
 
 export CUDA_VISIBLE_DEVICES=0,1
 
@@ -31,7 +32,7 @@ fi
 
 ARGS="--output_dir ${OUTPUT_DIR} \
     --train_metas_path ${TRAIN_METAS_PATH} \
-    --smolvlm_model_path HuggingFaceTB/SmolVLM-500M-Instruct \
+    --smolvlm_model_path ${SMOLVLM_MODEL_PATH} \
     --action_mode so101_joint \
     --batch_size ${BATCH_SIZE} \
     --learning_rate ${LEARNING_RATE} \

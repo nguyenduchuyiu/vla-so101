@@ -43,7 +43,10 @@ def preprocess_images(obs: dict[str, np.ndarray]) -> tuple[torch.Tensor, torch.T
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--norm_stats", type=Path, default=Path("norm_stats/so101_norm.json"))
+    parser.add_argument(
+        "--norm_stats", type=Path,
+        default=Path("norm_stats/so101_observable_norm.json"),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--policy_seed", type=int)
     parser.add_argument("--source_index", type=int, choices=(0, 1), default=0)
@@ -62,6 +65,11 @@ def main() -> None:
         raise ValueError("--execute_steps must be in 1..10")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    autocast_dtype = (
+        torch.bfloat16
+        if device.type == "cuda" and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
     model = SmolVLMVLA.from_pretrained(args.checkpoint).to(device).eval()
     if model.action_mode not in ("so101_joint", "so101_delta"):
         raise ValueError(f"Checkpoint action mode is {model.action_mode}, expected SO101")
@@ -116,7 +124,7 @@ def main() -> None:
             language = processor.encode_language([instruction])
             with torch.inference_mode(), torch.autocast(
                 device_type=device.type,
-                dtype=torch.bfloat16,
+                dtype=autocast_dtype,
                 enabled=device.type == "cuda",
             ):
                 actions = model.generate_actions(

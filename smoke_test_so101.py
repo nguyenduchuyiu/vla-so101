@@ -3,7 +3,7 @@
 import torch
 from torch.optim import AdamW
 
-from datasets import create_smolvlm_dataloader
+from simvla_datasets import create_smolvlm_dataloader
 from models.action_hub import build_action_space
 from models.configuration_smolvlm_vla import SmolVLMVLAConfig
 from models.modeling_smolvlm_vla import SmolVLMVLA
@@ -16,7 +16,7 @@ def main() -> None:
 
     loader = create_smolvlm_dataloader(
         batch_size=1,
-        metas_path="datasets/metas/so101_train.json",
+        metas_path="datasets/metas/so101_observable_train.json",
         num_actions=10,
         training=False,
         action_mode="so101_joint",
@@ -39,7 +39,7 @@ def main() -> None:
     )
     model = SmolVLMVLA(config)
     model.action_space = build_action_space(
-        "so101_joint", norm_stats_path="norm_stats/so101_norm.json"
+        "so101_joint", norm_stats_path="norm_stats/so101_observable_norm.json"
     )
     model.vlm.requires_grad_(False)
     model.cuda().train()

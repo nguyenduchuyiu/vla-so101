@@ -67,7 +67,7 @@ From this repository, using the workspace Conda environment:
 conda run -n vla bash train_smolvlm_so101.sh
 ```
 
-The launcher reads `../data/so101_counterfactual`, uses only its train split,
+The launcher reads `../data/so101_counterfactual_observable`, uses only its train split,
 and predicts the next 10 absolute joint commands from two camera views.
 
 Run a checkpoint in SO101-Nexus and save a rollout video:

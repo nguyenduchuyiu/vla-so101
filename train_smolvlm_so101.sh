@@ -10,12 +10,12 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 SAMPLES_PER_EPISODE=${SAMPLES_PER_EPISODE:-32}
 ACTION_MODE=${ACTION_MODE:-so101_joint}
-NORM_STATS_PATH=${NORM_STATS_PATH:-./norm_stats/so101_norm.json}
+NORM_STATS_PATH=${NORM_STATS_PATH:-./norm_stats/so101_observable_norm.json}
 
 export CUDA_VISIBLE_DEVICES=0
 
-SO101_DATA_DIR="../data/so101_counterfactual"
-TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./datasets/metas/so101_train.json}
+SO101_DATA_DIR="../data/so101_counterfactual_observable"
+TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./datasets/metas/so101_observable_train.json}
 SMOLVLM_MODEL="HuggingFaceTB/SmolVLM-500M-Instruct"
 
 if [ ! -f "$TRAIN_METAS_PATH" ] || [ ! -f "$NORM_STATS_PATH" ]; then

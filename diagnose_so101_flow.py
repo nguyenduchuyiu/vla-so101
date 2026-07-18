@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from datasets.dataset_smolvlm import SmolVLMDataReader
+from simvla_datasets.dataset_smolvlm import SmolVLMDataReader
 from models.modeling_smolvlm_vla import SmolVLMVLA
 from models.processing_smolvlm_vla import SmolVLMVLAProcessor
 
@@ -18,7 +18,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--episode", type=Path, required=True)
-    parser.add_argument("--norm_stats", type=Path, default=Path("norm_stats/so101_norm.json"))
+    parser.add_argument(
+        "--norm_stats", type=Path,
+        default=Path("norm_stats/so101_observable_norm.json"),
+    )
     parser.add_argument("--sample_index", type=int, default=0)
     parser.add_argument("--instruction", type=str, required=True)
     parser.add_argument("--trials", type=int, default=32)
@@ -36,7 +39,7 @@ def main() -> None:
         model.action_space.postprocess = model.action_space.unnormalize_action
     processor = SmolVLMVLAProcessor.from_pretrained(model.config.smolvlm_model_path)
     transform = SmolVLMDataReader(
-        "datasets/metas/so101_train.json", training=False, image_size=384,
+        "datasets/metas/so101_observable_train.json", training=False, image_size=384,
         action_mode="so101_joint", num_views=2,
     ).image_aug
 
