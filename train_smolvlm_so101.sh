@@ -5,12 +5,17 @@ set -e
 BATCH_SIZE=${1:-1}
 OUTPUT_DIR=${2:-./runs/simvla_so101_small}
 RESUME_CKPT=${3:-""}
+ITERS=${ITERS:-20000}
+SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
+LEARNING_RATE=${LEARNING_RATE:-1e-4}
+SAMPLES_PER_EPISODE=${SAMPLES_PER_EPISODE:-32}
+ACTION_MODE=${ACTION_MODE:-so101_joint}
+NORM_STATS_PATH=${NORM_STATS_PATH:-./norm_stats/so101_norm.json}
 
 export CUDA_VISIBLE_DEVICES=0
 
 SO101_DATA_DIR="../data/so101_counterfactual"
-TRAIN_METAS_PATH="./datasets/metas/so101_train.json"
-NORM_STATS_PATH="./norm_stats/so101_norm.json"
+TRAIN_METAS_PATH=${TRAIN_METAS_PATH:-./datasets/metas/so101_train.json}
 SMOLVLM_MODEL="HuggingFaceTB/SmolVLM-500M-Instruct"
 
 if [ ! -f "$TRAIN_METAS_PATH" ] || [ ! -f "$NORM_STATS_PATH" ]; then
@@ -23,21 +28,22 @@ fi
 ARGS="--output_dir ${OUTPUT_DIR} \
     --train_metas_path ${TRAIN_METAS_PATH} \
     --smolvlm_model_path ${SMOLVLM_MODEL} \
-    --action_mode so101_joint \
+    --action_mode ${ACTION_MODE} \
     --batch_size ${BATCH_SIZE} \
-    --learning_rate 1e-4 \
+    --learning_rate ${LEARNING_RATE} \
     --learning_coef 0.0 \
     --num_actions 10 \
     --num_views 2 \
+    --samples_per_episode ${SAMPLES_PER_EPISODE} \
     --freeze_vlm \
-    --iters 20000 \
+    --iters ${ITERS} \
     --warmup_steps 0 \
     --freeze_steps 0 \
     --hidden_size 768 \
     --depth 12 \
     --num_heads 12 \
     --num_workers 0 \
-    --save_interval 10000 \
+    --save_interval ${SAVE_INTERVAL} \
     --log_interval 20 \
     --image_size 384 \
     --norm_stats_path ${NORM_STATS_PATH} \

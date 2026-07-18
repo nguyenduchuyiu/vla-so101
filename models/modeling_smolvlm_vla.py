@@ -157,8 +157,8 @@ class SmolVLMVLA(PreTrainedModel):
             for img_tensor in valid_images:
                 # Denormalize and convert to PIL
                 img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
-                # Assuming normalized with ImageNet stats, denormalize
-                img_np = img_np * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                # Undo SmolVLM/SigLIP normalization.
+                img_np = img_np * 0.5 + 0.5
                 img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
                 pil_images.append(Image.fromarray(img_np))
             
@@ -212,6 +212,7 @@ class SmolVLMVLA(PreTrainedModel):
         pixel_values: torch.FloatTensor,    # [B, V, C, H, W] - Already preprocessed
         image_mask: torch.Tensor,           # [B, V]
         input_ids: torch.LongTensor | None = None,  # [B, L] - Pre-tokenized text
+        language_attention_mask: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Efficient VLM forward for training - uses FULL VLM to fuse vision and language.
@@ -273,6 +274,9 @@ class SmolVLMVLA(PreTrainedModel):
         dtype = image_features.dtype
         
         # ========== Step 2: Get text embeddings ==========
+        if language_attention_mask is None:
+            pad_id = self.vlm_processor.tokenizer.pad_token_id
+            language_attention_mask = input_ids.ne(pad_id)
         # Idefics3 (SmolVLM) uses 'text_model' instead of 'language_model'
         text_embeds = self.vlm.model.text_model.get_input_embeddings()(input_ids)  # [B, L, D]
         
@@ -313,7 +317,12 @@ class SmolVLMVLA(PreTrainedModel):
         for b, embeds in enumerate(batch_inputs_embeds):
             seq_len = embeds.shape[0]
             padded_inputs_embeds[b, :seq_len] = embeds
-            attention_mask[b, :seq_len] = 1
+            image_token_count = int(valid_per_sample[b].item()) * num_patches
+            text_token_count = embeds.shape[0] - image_token_count
+            attention_mask[b, :image_token_count] = 1
+            attention_mask[b, image_token_count:seq_len] = language_attention_mask[
+                b, :text_token_count
+            ].to(dtype=torch.long)
         
         # ========== Step 5: Forward through text model (Idefics3/SmolVLM) ==========
         # This fuses visual and linguistic information through the full transformer
@@ -338,6 +347,7 @@ class SmolVLMVLA(PreTrainedModel):
         image_mask: torch.Tensor,           # [B, V]
         proprio: torch.Tensor,              # [B, dim_proprio]
         action: torch.Tensor,               # [B, T=num_actions, D=dim_action]
+        language_attention_mask: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Flow Matching training.
@@ -347,27 +357,32 @@ class SmolVLMVLA(PreTrainedModel):
         3) Target: velocity u_t = noise - actions
         4) Model predicts v_t, compute MSE(v_t, u_t)
         """
-        enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+        enc = self.forward_vlm_efficient(
+            image_input, image_mask, input_ids, language_attention_mask
+        )
 
         B = input_ids.shape[0]
         device = input_ids.device
         
-        # Beta(1.5, 1) time sampling
-        beta_dist = torch.distributions.Beta(
-            torch.tensor(1.5, device=device), 
-            torch.tensor(1.0, device=device)
-        )
-        t = beta_dist.sample((B,)) * 0.999 + 0.001
+        # Cover the complete ODE, including the action endpoint near t=0.
+        # Beta(1.5, 1) under-sampled that endpoint and produced low logged loss
+        # while the integrated SO-101 action remained inaccurate.
+        t = torch.rand(B, device=device) * 0.999 + 0.001
 
-        # Normalize action and proprio
-        if hasattr(self.action_space, 'normalize_action'):
+        # Normalize the joint contract. Some spaces represent future commands
+        # relative to the current proprioception.
+        if self.action_mode == "so101_delta":
+            proprio_norm, action_norm = self.action_space.preprocess(proprio, action)
+        elif hasattr(self.action_space, 'normalize_action'):
             action_norm = self.action_space.normalize_action(action)
         elif hasattr(self.action_space, 'normalize'):
             action_norm = self.action_space.normalize(action)
         else:
             action_norm = action
             
-        if hasattr(self.action_space, 'normalize_state'):
+        if self.action_mode == "so101_delta":
+            pass
+        elif hasattr(self.action_space, 'normalize_state'):
             proprio_norm = self.action_space.normalize_state(proprio)
         elif hasattr(self.action_space, 'normalize'):
             proprio_norm = self.action_space.normalize(proprio)
@@ -389,7 +404,15 @@ class SmolVLMVLA(PreTrainedModel):
         )
         
         # MSE loss
-        velocity_loss = torch.mean(torch.square(v_t - u_t))
+        squared_error = torch.square(v_t - u_t)
+        if self.action_mode in ("so101_joint", "so101_delta"):
+            # The binary grasp command is one channel among six and was otherwise
+            # dominated by smooth arm-joint targets.
+            action_dim = squared_error.shape[-1]
+            channel_weights = torch.ones(action_dim, device=device)
+            channel_weights[5] = 10.0
+            squared_error = squared_error * channel_weights.view(1, 1, action_dim)
+        velocity_loss = torch.mean(squared_error)
         
         return {"velocity_loss": velocity_loss}
 
@@ -401,6 +424,7 @@ class SmolVLMVLA(PreTrainedModel):
         image_input: torch.FloatTensor,
         image_mask: torch.Tensor,
         proprio: torch.Tensor,
+        language_attention_mask: torch.Tensor | None = None,
         steps: int = 10,
     ) -> torch.Tensor:
         """
@@ -413,7 +437,9 @@ class SmolVLMVLA(PreTrainedModel):
         3) Final x_0 ≈ target action
         """
         self.eval()
-        enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+        enc = self.forward_vlm_efficient(
+            image_input, image_mask, input_ids, language_attention_mask
+        )
 
         B = input_ids.shape[0]
         D = self.action_space.dim_action
@@ -446,6 +472,8 @@ class SmolVLMVLA(PreTrainedModel):
         
             x_t = x_t + dt * v_t
         
+        if hasattr(self.action_space, "postprocess_with_proprio"):
+            return self.action_space.postprocess_with_proprio(x_t, proprio)
         return self.action_space.postprocess(x_t)
 
     # =============================== FastAPI service =============================

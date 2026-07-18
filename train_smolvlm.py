@@ -135,6 +135,8 @@ def get_args_parser():
                         help="Action horizon (number of future actions to predict)")
     parser.add_argument("--num_views", type=int, default=3,
                         help="Number of camera views emitted by the dataset")
+    parser.add_argument("--samples_per_episode", type=int, default=None,
+                        help="Cap shuffled samples per episode before switching episodes")
     
     # WandB
     parser.add_argument("--wandb_project", type=str, default=None)
@@ -317,6 +319,7 @@ def main(args):
         if args.action_mode != model.action_mode:
             logger.warning(f"Overriding model action_mode from '{model.action_mode}' to '{args.action_mode}'")
             model.action_mode = args.action_mode
+            model.config.action_mode = args.action_mode
             model.action_space = build_action_space(args.action_mode, **action_space_kwargs)
         elif action_space_kwargs:
             model.action_space = build_action_space(args.action_mode, **action_space_kwargs)
@@ -375,6 +378,7 @@ def main(args):
         num_workers=args.num_workers,
         image_size=args.image_size,
         num_views=args.num_views,
+        samples_per_episode=args.samples_per_episode,
     )
 
     # Optimizer

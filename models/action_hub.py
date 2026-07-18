@@ -279,6 +279,48 @@ class SO101JointActionSpace(LiberoJointActionSpace):
     dim_proprio = 6
     gripper_idx = (5,)
 
+    def postprocess(self, action: torch.Tensor) -> torch.Tensor:
+        action = super().postprocess(action)
+        if self.action_norm_stats is not None and self.action_norm_stats.q99 is not None:
+            closed = self.action_norm_stats.q01[5].to(action.device)
+            opened = self.action_norm_stats.q99[5].to(action.device)
+        else:
+            closed = action.new_tensor(0.0)
+            opened = action.new_tensor(100.0)
+        midpoint = (closed + opened) / 2
+        action[..., 5] = torch.where(action[..., 5] >= midpoint, opened, closed)
+        return action
+
+
+@register_action("so101_delta")
+class SO101DeltaActionSpace(SO101JointActionSpace):
+    """SO-101 future arm displacement from current state plus absolute gripper."""
+
+    def _to_delta(self, proprio: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        delta = action.clone()
+        delta[..., :5] = action[..., :5] - proprio[..., None, :5]
+        return delta
+
+    def preprocess(self, proprio, action, mode="train"):
+        return self.normalize_state(proprio), self.normalize_action(
+            self._to_delta(proprio, action)
+        )
+
+    def postprocess_with_proprio(
+        self, action: torch.Tensor, proprio: torch.Tensor
+    ) -> torch.Tensor:
+        action = self.unnormalize_action(action)
+        action[..., :5] += proprio[..., None, :5]
+        if self.action_norm_stats is not None and self.action_norm_stats.q99 is not None:
+            closed = self.action_norm_stats.q01[5].to(action.device)
+            opened = self.action_norm_stats.q99[5].to(action.device)
+        else:
+            closed, opened = action.new_tensor(0.0), action.new_tensor(100.0)
+        action[..., 5] = torch.where(
+            action[..., 5] >= (closed + opened) / 2, opened, closed
+        )
+        return action
+
 
 # =============================================================================
 # Exports
@@ -289,6 +331,7 @@ __all__ = [
     "register_action",
     "LiberoJointActionSpace",
     "SO101JointActionSpace",
+    "SO101DeltaActionSpace",
     "ACTION_REGISTRY",
     "NormStats",
     "load_norm_stats",

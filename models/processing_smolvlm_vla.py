@@ -140,7 +140,10 @@ class SmolVLMVLAProcessor:
             max_length=self.language_max_length,
             truncation=True,
         )
-        return {"input_ids": inputs["input_ids"]}
+        return {
+            "input_ids": inputs["input_ids"],
+            "language_attention_mask": inputs["attention_mask"],
+        }
 
     # ================== OPTIMIZED IMAGE ENCODING ==================
     def encode_image(

@@ -177,6 +177,7 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         with torch.no_grad():
             actions = model.generate_actions(
                 input_ids=lang['input_ids'],
+                language_attention_mask=lang['language_attention_mask'],
                 image_input=images,
                 image_mask=image_mask,
                 proprio=proprio_tensor,
