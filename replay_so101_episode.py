@@ -3,31 +3,55 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import mediapy as media
 from so101_nexus.lerobot_dataset import dataset_row_to_sim_qpos
 
-from vla_data.counterfactual_collector import _gripper_limits, _make_env
+from old_vla_data.counterfactual_collector import _gripper_limits, _make_env
+
+
+def _episode_meta(episode_path: Path) -> dict:
+    """Look up this episode's scene_seed/source_index/target_index from the sibling meta.
+
+    The NPZ stores no scene metadata; it lives in ``meta/episodes.jsonl`` next to
+    ``episodes/``. Episode index is parsed from the filename (``episode_000007``
+    -> 7). The collector reset with ``seed=scene_seed``, so replay must too.
+    """
+    episode_index = int(episode_path.stem.split("_")[-1])
+    meta_path = episode_path.parent.parent / "meta" / "episodes.jsonl"
+    with meta_path.open() as f:
+        for line in f:
+            row = json.loads(line)
+            if row["episode_index"] == episode_index:
+                return row
+    raise FileNotFoundError(f"episode {episode_index} not found in {meta_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episode", type=Path, required=True)
-    parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--source_index", type=int, choices=(0, 1), required=True)
-    parser.add_argument("--target_index", type=int, choices=(0, 1), required=True)
-    parser.add_argument("--output", type=Path)
+    # Defaults are inferred from the episode's meta row; pass explicitly to override.
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--source_index", type=int, default=None)
+    parser.add_argument("--target_index", type=int, default=None)
+    parser.add_argument("--output", type=Path, default="outputs/out.mp4")
     args = parser.parse_args()
+
+    meta = _episode_meta(args.episode)
+    seed = args.seed if args.seed is not None else meta["scene_seed"]
+    source_index = args.source_index if args.source_index is not None else meta["source_index"]
+    target_index = args.target_index if args.target_index is not None else meta["target_index"]
 
     with np.load(args.episode) as episode:
         actions = episode["action"].copy()
 
     env = _make_env(("red", "orange"), ("green", "white"),
-                    args.source_index, args.target_index, 256, 256)
+                    source_index, target_index, 256, 256)
     try:
-        obs, info = env.reset(seed=args.seed)
+        obs, info = env.reset(seed=seed)
         frames = [np.concatenate([obs["overhead_camera"], obs["wrist_camera"]], axis=1)]
         limits = _gripper_limits(env)
         for action_row in actions:

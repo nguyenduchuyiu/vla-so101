@@ -16,76 +16,59 @@ conda activate simvla
 
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install transformers>=4.57.0
-pip install peft==0.17.1 accelerate fastapi tensorboard uvicorn json_numpy safetensors scipy einops timm mmengine pyarrow h5py mediapy num2words av wandb websockets msgpack_numpy
+pip install peft==0.17.1 accelerate tensorboard safetensors scipy einops timm mmengine pyarrow h5py mediapy num2words av
 pip install flash-attn==2.5.6 --no-build-isolation
-pip install tensorflow tensorflow-datasets
 ```
 
 > Important: Use `transformers>=4.57.0`.
 
-## Training (LIBERO Dataset)
-
-### 1. Prepare LIBERO Dataset
-
-Download [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) dataset, and place it in `./datasets/metas/`.
-
-### 2. Create Training Metadata
-
-```bash
-python create_libero_meta.py \
-    --data_dir ./datasets/metas \
-    --subsets libero_10 libero_goal libero_object libero_spatial \
-    --output ./datasets/metas/libero_train.json
-```
-
-### 3. Compute Normalization Statistics
-
-```bash
-python compute_libero_norm_stats.py \
-    --data_dir ./datasets/metas \
-    --subsets libero_10 libero_goal libero_object libero_spatial \
-    --output ./norm_stats/libero_norm.json
-```
-
-### 4. Start Training
-
-**Small Model Configuration:**
-```bash
-bash train_smolvlm_small.sh
-```
-
-**Large Model Configuration:**
-```bash
-bash train_smolvlm_large.sh
-```
-
 ## Training on the local SO-101 dataset
 
-From this repository, using the workspace Conda environment:
+The balanced counterfactual SO101-delta path trains a flow-matching policy on
+decision-frame counterfactual pairs plus phase-uniform execution frames.
+
+- **Data**: `./data/branch_source` (grouped counterfactual NPZ; `scene_seed=0`
+  yields four source/target branches).
+- **Batch contract**: 256 = 64 source-decision + 64 target-decision + 128
+  execution frames (25/25/50). Each counterfactual pair shares observation,
+  proprioception, flow time and noise (`flow_group_id`) and differs only in the
+  instruction and oracle action chunk.
+- **Action space**: `so101_delta` (5 arm joints as deltas from current proprio +
+  1 absolute gripper), next 10 commands, two camera views at 384x384.
+
+The launcher rebuilds the balanced training meta (deterministic) and ensures the
+delta norm stats exist, then trains.
+
+**1 GPU (bf16):**
 
 ```bash
-conda run -n vla bash train_smolvlm_so101.sh
+conda run -n base bash train_smolvlm_so101.sh              # batch 256 (design point)
+BATCH_SIZE=8 conda run -n base bash train_smolvlm_so101.sh # reproduce the live overfit run
 ```
 
-The launcher reads `../data/so101_counterfactual_observable`, uses only its train split,
-and predicts the next 10 absolute joint commands from two camera views.
-
-Run a checkpoint in SO101-Nexus and save a rollout video:
+**2 GPUs (fp16, e.g. Kaggle T4):**
 
 ```bash
-conda run -n vla python evaluate_so101.py \
-    --checkpoint runs/simvla_so101_small/ckpt-10000
+conda run -n base bash train_smolvlm_so101_kaggle.sh
 ```
 
-### 5. Evaluation
+`BATCH_SIZE` is per-GPU and must be divisible by 8 (the balanced sampler
+enforces the 25/25/50 contract per batch). Lower it from 256 if a GPU OOMs.
+
+**Resume from a checkpoint** (args: `BATCH_SIZE OUTPUT_DIR RESUME_CKPT`):
 
 ```bash
-cd evaluation/libero
+conda run -n base bash train_smolvlm_so101.sh 256 \
+    ./runs/so101_balanced_delta_seed0_scratch \
+    ./runs/so101_balanced_delta_seed0_scratch/ckpt-500
 ```
 
-### 6. Results
+**Evaluate** a checkpoint in SO101-Nexus and save a rollout video:
 
-<img width="506" height="1220" alt="image" src="https://github.com/user-attachments/assets/6ee1cd5e-42c5-4cf7-9cce-6dc04c1a215f" />
+```bash
+conda run -n base python evaluate_so101.py \
+    --checkpoint runs/so101_balanced_delta_seed0_scratch/ckpt-10000
+```
 
 ## Model Architecture
 

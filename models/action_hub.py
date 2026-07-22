@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Iterable, Tuple, Dict, Type, Optional
+from typing import Tuple, Dict, Type, Optional
 from pathlib import Path
 import json
 import torch
@@ -108,7 +108,6 @@ class BaseActionSpace(nn.Module):
     Each subclass defines:
       - `dim_action`: dimension of the action vector.
       - `gripper_idx`: indices of gripper channels.
-      - `compute_loss(pred, target)`: supervised loss for this space.
       - `preprocess(proprio, action, mode)`: pre-step modifications.
       - `postprocess(action)`: post-step corrections.
     """
@@ -119,13 +118,6 @@ class BaseActionSpace(nn.Module):
 
     def __init__(self):
         super().__init__()
-
-    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, torch.Tensor]:
-        raise NotImplementedError
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Alias for compute_loss."""
-        return self.compute_loss(pred, target)
 
     def preprocess(
         self,
@@ -139,15 +131,6 @@ class BaseActionSpace(nn.Module):
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Default: return unchanged."""
         return action
-
-
-# =============================================================================
-# Utilities
-# =============================================================================
-def _ensure_indices_valid(D: int, idx: Iterable[int], name: str) -> None:
-    bad = [i for i in idx if i < 0 or i >= D]
-    if bad:
-        raise IndexError(f"{name} contains out-of-range indices {bad} for action dim D={D}")
 
 
 # =============================================================================
@@ -175,10 +158,8 @@ class LiberoJointActionSpace(BaseActionSpace):
     def __init__(
         self,
         norm_stats_path: Optional[str] = None,
-        use_quantile_norm: bool = False,
     ):
         super().__init__()
-        self.use_quantile_norm = use_quantile_norm
         self.state_norm_stats: Optional[NormStats] = None
         self.action_norm_stats: Optional[NormStats] = None
         
@@ -209,33 +190,21 @@ class LiberoJointActionSpace(BaseActionSpace):
         """Normalize using specified statistics."""
         if stats.mean.device != x.device:
             stats.to(x.device)
-        
+
         D = x.shape[-1]
-        
-        if self.use_quantile_norm and stats.q01 is not None and stats.q99 is not None:
-            q01 = stats.q01[..., :D]
-            q99 = stats.q99[..., :D]
-            return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
-        else:
-            mean = stats.mean[..., :D]
-            std = stats.std[..., :D]
-            return (x - mean) / (std + 1e-6)
+        mean = stats.mean[..., :D]
+        std = stats.std[..., :D]
+        return (x - mean) / (std + 1e-6)
     
     def _unnormalize_with_stats(self, x: torch.Tensor, stats: NormStats) -> torch.Tensor:
         """Unnormalize using specified statistics."""
         if stats.mean.device != x.device:
             stats.to(x.device)
-        
+
         D = x.shape[-1]
-            
-        if self.use_quantile_norm and stats.q01 is not None and stats.q99 is not None:
-            q01 = stats.q01[..., :D]
-            q99 = stats.q99[..., :D]
-            return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
-        else:
-            mean = stats.mean[..., :D]
-            std = stats.std[..., :D]
-            return x * (std + 1e-6) + mean
+        mean = stats.mean[..., :D]
+        std = stats.std[..., :D]
+        return x * (std + 1e-6) + mean
     
     def normalize_state(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize state/proprio."""
@@ -254,11 +223,6 @@ class LiberoJointActionSpace(BaseActionSpace):
         if self.action_norm_stats is not None:
             return self._unnormalize_with_stats(x, self.action_norm_stats)
         return x
-
-    def compute_loss(self, pred, target):
-        """Full-dimension MSE loss."""
-        loss = torch.square(pred - target)
-        return {"velocity_loss": torch.mean(loss)}
 
     def preprocess(self, proprio, action, mode="train"):
         """Normalize proprio and action separately."""

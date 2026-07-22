@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from functools import partial
-from typing import Final, Iterable, Tuple
+from typing import Iterable, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,11 +27,6 @@ def _to_2tuple(x) -> Tuple:
         t = tuple(x)
         return (t[0], t[1]) if len(t) >= 2 else (t[0], t[0])
     return (x, x)
-
-
-def _has_sdp_attention() -> bool:
-    """Check if we can use PyTorch fused scaled_dot_product_attention."""
-    return hasattr(F, "scaled_dot_product_attention")
 
 
 # ---------------------------------- MLP --------------------------------------
@@ -76,9 +71,7 @@ class Mlp(nn.Module):
 # -------------------------------- Attention ----------------------------------
 
 class Attention(nn.Module):
-    """Multi-Head Self-Attention with optional fused SDPA fallback."""
-
-    fused_attn: Final[bool]
+    """Multi-Head Self-Attention (fused SDPA)."""
 
     def __init__(
         self,
@@ -95,7 +88,6 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.fused_attn = _has_sdp_attention()
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -114,17 +106,10 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
 
         x = x.transpose(1, 2).reshape(B, T, C)
         x = self.proj(x)

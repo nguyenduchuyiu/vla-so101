@@ -2,7 +2,7 @@
 SmolVLM-VLA Training Script
 
 Training script for SmolVLM-VLA using SmolVLM-500M-Instruct as backbone.
-Uses 512x512 image resolution and unified VLM features (no aux_visual_inputs).
+Uses 384x384 image resolution and unified VLM features (no aux_visual_inputs).
 
 Usage:
     python train_smolvlm.py \
@@ -10,7 +10,7 @@ Usage:
         --train_metas_path ./train_metas.json \
         --batch_size 32 \
         --learning_rate 1e-4 \
-        --action_mode galaxea_joint \
+        --action_mode so101_delta \
         --num_actions 10
 """
 
@@ -36,13 +36,26 @@ from models.processing_smolvlm_vla import SmolVLMVLAProcessor
 import logging
 import sys
 
-# WandB integration (optional)
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    wandb = None
+
+OPTIMIZER_STATE_FILENAME = "optimizer.pt"
+
+
+def save_optimizer_state(accelerator, optimizer, checkpoint_dir: str) -> None:
+    """Persist Adam moments alongside Hugging Face model weights."""
+    accelerator.save(
+        optimizer.state_dict(),
+        os.path.join(checkpoint_dir, OPTIMIZER_STATE_FILENAME),
+    )
+
+
+def load_optimizer_state(optimizer, checkpoint_dir: str) -> bool:
+    """Restore optimizer state; return False for legacy weight-only checkpoints."""
+    path = os.path.join(checkpoint_dir, OPTIMIZER_STATE_FILENAME)
+    if not os.path.isfile(path):
+        return False
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    optimizer.load_state_dict(state)
+    return True
 
 
 # ============================================================
@@ -105,22 +118,22 @@ def get_args_parser():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     # Schedule
-    parser.add_argument("--iters", type=int, default=1000000)
+    parser.add_argument("--iters", type=int, default=10000)
     parser.add_argument("--freeze_steps", type=int, default=1000)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--use_cosine_decay", action="store_true", default=False)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
 
     # Logging / saving
-    parser.add_argument("--save_interval", type=int, default=50000)
+    parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--log_interval", type=int, default=20)
 
     # System
     parser.add_argument("--seed", type=int, default=0)
     
     # Action mode
-    parser.add_argument("--action_mode", type=str, default="galaxea_joint",
-                        help="Action mode: galaxea_joint, galaxea, libero_joint, etc.")
+    parser.add_argument("--action_mode", type=str, default="so101_delta",
+                        help="Action mode: so101_joint or so101_delta")
     
     # Data loading
     parser.add_argument("--num_workers", type=int, default=4,
@@ -137,10 +150,6 @@ def get_args_parser():
                         help="Number of camera views emitted by the dataset")
     parser.add_argument("--samples_per_episode", type=int, default=None,
                         help="Cap shuffled samples per episode before switching episodes")
-    
-    # WandB
-    parser.add_argument("--wandb_project", type=str, default=None)
-    parser.add_argument("--wandb_api_key", type=str, default=None)
     
     # Resume control
     parser.add_argument("--resume", action="store_true", default=False,
@@ -209,13 +218,6 @@ def set_group_lr(optim: torch.optim.Optimizer, name: str, lr: float):
             g["lr"] = lr
 
 
-def get_group_lr(optim: torch.optim.Optimizer, name: str) -> float:
-    for g in optim.param_groups:
-        if g["name"] == name:
-            return g["lr"]
-    return 0.0
-
-
 def linear_warmup_cosine(step, start, warmup, total, base_lr, min_ratio):
     """Linear warmup followed by cosine decay."""
     if step < start:
@@ -260,15 +262,7 @@ def main(args):
     if args.freeze_vlm and args.lora_rank > 0:
         raise ValueError("--freeze_vlm and --lora_rank cannot be used together")
     
-    # WandB setup
-    wandb_api_key = os.environ.get("WANDB_API_KEY") or args.wandb_api_key
-    wandb_project = os.environ.get("WANDB_PROJECT") or args.wandb_project
-    use_wandb = WANDB_AVAILABLE and wandb_api_key
-
     log_with = ["tensorboard"]
-    if use_wandb:
-        log_with.append("wandb")
-        os.environ["WANDB_API_KEY"] = wandb_api_key
 
     # Accelerator setup
     # Reentrant gradient checkpointing and DDP's unused-parameter traversal can
@@ -301,14 +295,7 @@ def main(args):
         "lora_dropout": args.lora_dropout,
     }
     
-    if use_wandb:
-        accelerator.init_trackers(
-            project_name=wandb_project,
-            config=tracker_config,
-            init_kwargs={"wandb": {"name": f"smolvlm-{time.strftime('%Y%m%d-%H%M%S')}"}}
-        )
-    else:
-        accelerator.init_trackers("SmolVLM-VLA-Training", config=tracker_config)
+    accelerator.init_trackers("SmolVLM-VLA-Training", config=tracker_config)
 
     accelerator.wait_for_everyone()
     logger = get_logger(__name__, output_dir=output_dir, accelerator=accelerator)
@@ -331,7 +318,17 @@ def main(args):
     
     if load_path and os.path.isdir(load_path) and os.path.exists(os.path.join(load_path, "model.safetensors")):
         logger.info(f"Loading SmolVLM-VLA from checkpoint: {load_path}")
-        model = SmolVLMVLA.from_pretrained(load_path)
+        checkpoint_config = SmolVLMVLAConfig.from_pretrained(load_path)
+        if accelerator.device.type == "mps":
+            # The Kaggle checkpoint records an FP16 VLM, but Metal training is
+            # unstable with its mixed FP16 matmuls. Unified-memory Macs can keep
+            # the branch-point diagnostic in FP32.
+            checkpoint_config.vlm_dtype = "float32"
+        model = SmolVLMVLA.from_pretrained(
+            load_path,
+            config=checkpoint_config,
+            dtype=torch.float32 if accelerator.device.type == "mps" else None,
+        )
 
         checkpoint_lora_rank = getattr(model.config, "lora_rank", 0)
         if args.lora_rank != checkpoint_lora_rank:
@@ -445,6 +442,16 @@ def main(args):
         betas=tuple(args.betas),
         lr_coef_vlm=args.learning_coef,
     )
+    optimizer_restored = False
+    if args.resume and load_path and os.path.isdir(load_path):
+        optimizer_restored = load_optimizer_state(optim, load_path)
+        if optimizer_restored:
+            logger.info(f"Restored optimizer state from: {load_path}")
+        else:
+            logger.warning(
+                f"Resume checkpoint has no {OPTIMIZER_STATE_FILENAME}; "
+                "weights/global_step will resume but Adam moments start fresh"
+            )
     model, optim = accelerator.prepare(model, optim)
 
     # Training loop
@@ -519,8 +526,15 @@ def main(args):
                 save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
                 accelerator.print(f"💾 Saving model to {save_dir}")
                 accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
+                save_optimizer_state(accelerator, optim, save_dir)
                 with open(os.path.join(save_dir, "state.json"), "w") as f:
-                    json.dump({"global_step": global_step}, f)
+                    json.dump(
+                        {
+                            "global_step": global_step,
+                            "optimizer_state": OPTIMIZER_STATE_FILENAME,
+                        },
+                        f,
+                    )
         if should_save:
             accelerator.wait_for_everyone()
                     

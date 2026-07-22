@@ -8,34 +8,27 @@ from pathlib import Path
 import mediapy as media
 import numpy as np
 import torch
+from PIL import Image
 from so101_nexus.lerobot_dataset import (
     dataset_row_to_sim_qpos,
     sim_qpos_to_dataset_row,
 )
-from torchvision import transforms
-from torchvision.transforms import InterpolationMode
 
-from models.modeling_smolvlm_vla import SmolVLMVLA
-from models.processing_smolvlm_vla import SmolVLMVLAProcessor
-from vla_data.counterfactual_collector import _gripper_limits, _make_env
-from vla_data.language import canonical_instruction
+from models.utils import load_vla_for_inference, pick_device
+from simvla_datasets.utils import build_image_transform
+from cf_data.collect import make_env
+from cf_data.core import OBJECTIVE_COLORS, objective_instruction
+from old_vla_data.counterfactual_collector import _gripper_limits
 
 
-def preprocess_images(obs: dict[str, np.ndarray]) -> tuple[torch.Tensor, torch.Tensor]:
-    transform = transforms.Compose(
-        [
-            transforms.ToPILImage(),
-            transforms.Resize(
-                (384, 384), interpolation=InterpolationMode.BICUBIC, antialias=True
-            ),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
-            ),
-        ]
-    )
+def preprocess_images(
+    obs: dict[str, np.ndarray], transform
+) -> tuple[torch.Tensor, torch.Tensor]:
     images = torch.stack(
-        [transform(obs["overhead_camera"]), transform(obs["wrist_camera"])]
+        [
+            transform(Image.fromarray(obs["overhead_camera"])),
+            transform(Image.fromarray(obs["wrist_camera"])),
+        ]
     ).unsqueeze(0)
     return images, torch.tensor([[True, True]])
 
@@ -45,66 +38,41 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
         "--norm_stats", type=Path,
-        default=Path("norm_stats/so101_observable_norm.json"),
+        default=Path("norm_stats/cf_smoke_test_norm.json"),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--policy_seed", type=int)
-    parser.add_argument("--source_index", type=int, choices=(0, 1), default=0)
-    parser.add_argument("--target_index", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--objective_id", type=int, choices=range(5), default=0, help="0: red, 1: blue, 2: green, 3: yellow, 4: purple")
     parser.add_argument("--instruction", type=str)
     parser.add_argument("--execute_steps", type=int, default=5)
-    parser.add_argument("--max_replans", type=int, default=120)
-    parser.add_argument("--gripper_close_step", type=int)
-    parser.add_argument("--gripper_open_step", type=int)
-    parser.add_argument("--gripper_state_machine_episode", type=Path)
-    parser.add_argument("--gripper_pose_threshold", type=float, default=6.0)
-    parser.add_argument("--output", type=Path, default=Path("outputs/so101_demo.mp4"))
+    parser.add_argument("--max_replans", type=int, default=400)
+    parser.add_argument("--robot_noise", type=float, default=0.0, help="Initial robot pose noise (default 0.0 for exact overfit test)")
+    parser.add_argument("--output", type=Path, default=Path("outputs/cf_5obj_eval.mp4"))
     args = parser.parse_args()
 
     if args.execute_steps < 1 or args.execute_steps > 10:
         raise ValueError("--execute_steps must be in 1..10")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = pick_device()
     autocast_dtype = (
         torch.bfloat16
         if device.type == "cuda" and torch.cuda.is_bf16_supported()
         else torch.float16
     )
-    model = SmolVLMVLA.from_pretrained(args.checkpoint).to(device).eval()
+    model, processor = load_vla_for_inference(args.checkpoint, device)
     if model.action_mode not in ("so101_joint", "so101_delta"):
         raise ValueError(f"Checkpoint action mode is {model.action_mode}, expected SO101")
     model.action_space.load_norm_stats(str(args.norm_stats))
-    processor = SmolVLMVLAProcessor.from_pretrained(model.config.smolvlm_model_path)
+    image_transform = build_image_transform(model.config.image_size, False)
 
-    source_colors = ("red", "orange")
-    target_colors = ("green", "white")
-    env = _make_env(
-        source_colors,
-        target_colors,
-        args.source_index,
-        args.target_index,
-        256,
-        256,
-    )
+    env = make_env(width=256, height=256, source_index=args.objective_id, robot_init_qpos_noise=args.robot_noise)
     frames: list[np.ndarray] = []
-    gripper_phase = "open"
-    close_pose = release_pose = None
-    min_close_distance = min_release_distance = np.inf
-    if args.gripper_state_machine_episode:
-        with np.load(args.gripper_state_machine_episode) as episode:
-            recorded_actions = episode["action"]
-            recorded_states = episode["observation.state"]
-        transitions = np.flatnonzero(np.abs(np.diff(recorded_actions[:, 5])) > 5.0)
-        if len(transitions) != 2:
-            raise ValueError("expected exactly close and release gripper transitions")
-        close_pose = recorded_states[transitions[0], :5]
-        release_pose = recorded_states[transitions[1], :5]
     try:
         obs, info = env.reset(seed=args.seed)
-        instruction = args.instruction or canonical_instruction(env)
+        env.set_objective(args.objective_id)
+        instruction = args.instruction or objective_instruction(args.objective_id)
         limits = _gripper_limits(env)
         torch.manual_seed(args.seed if args.policy_seed is None else args.policy_seed)
-        executed_steps = 0
 
         frames.append(
             np.concatenate(
@@ -116,7 +84,7 @@ def main() -> None:
             # evaluation. Otherwise every observation gets an unrelated sampled plan.
             if args.policy_seed is not None:
                 torch.manual_seed(args.policy_seed)
-            images, image_mask = preprocess_images(obs)
+            images, image_mask = preprocess_images(obs, image_transform)
             state = sim_qpos_to_dataset_row(
                 np.asarray(obs["state"], dtype=np.float64),
                 gripper_limits_rad=limits,
@@ -138,35 +106,6 @@ def main() -> None:
 
             done = False
             for action_row in actions[: args.execute_steps]:
-                if close_pose is not None:
-                    current_row = sim_qpos_to_dataset_row(
-                        np.asarray(obs["state"], dtype=np.float64),
-                        gripper_limits_rad=limits,
-                    )
-                    close_distance = np.linalg.norm(current_row[:5] - close_pose)
-                    release_distance = np.linalg.norm(current_row[:5] - release_pose)
-                    min_close_distance = min(min_close_distance, close_distance)
-                    min_release_distance = min(min_release_distance, release_distance)
-                    if gripper_phase == "open" and close_distance < args.gripper_pose_threshold:
-                        gripper_phase = "closed"
-                    elif gripper_phase == "closed" and np.linalg.norm(
-                        current_row[:5] - release_pose
-                    ) < args.gripper_pose_threshold:
-                        gripper_phase = "released"
-                    action_row = action_row.copy()
-                    action_row[5] = (
-                        -0.0001521008525742218
-                        if gripper_phase == "closed"
-                        else 45.454463958740234
-                    )
-                if args.gripper_close_step is not None:
-                    action_row = action_row.copy()
-                    if executed_steps < args.gripper_close_step:
-                        action_row[5] = 45.454463958740234
-                    elif args.gripper_open_step is None or executed_steps < args.gripper_open_step:
-                        action_row[5] = -0.0001521008525742218
-                    else:
-                        action_row[5] = 45.454463958740234
                 command = dataset_row_to_sim_qpos(
                     action_row, gripper_limits_rad=limits
                 )
@@ -187,7 +126,6 @@ def main() -> None:
                         [obs["overhead_camera"], obs["wrist_camera"]], axis=1
                     )
                 )
-                executed_steps += 1
                 if done:
                     break
             if done:
@@ -202,10 +140,6 @@ def main() -> None:
     print(f"is_obj_placed: {bool(info.get('is_obj_placed', False))}")
     print(f"is_grasped: {bool(info.get('is_grasped', False))}")
     print(f"obj_to_target_dist: {float(info.get('obj_to_target_dist', np.inf)):.6f}")
-    if close_pose is not None:
-        print(f"gripper_phase: {gripper_phase}")
-        print(f"min_close_pose_distance: {min_close_distance:.3f}")
-        print(f"min_release_pose_distance: {min_release_distance:.3f}")
     print(f"video: {args.output}")
 
 

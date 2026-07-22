@@ -1,19 +1,13 @@
 from __future__ import annotations
 from typing import Dict, Type
 from .base import DomainHandler
-from .libero_hdf5 import LiberoHDF5Handler
-from .so101_npz import SO101NPZHandler
+from .cf_balanced import CFBalancedHandler
+from .so101_balanced_counterfactual import SO101BalancedCounterfactualHandler
 
 # Registry for dataset handlers
 _REGISTRY: Dict[str, Type[DomainHandler]] = {
-    # LIBERO (original HDF5 format)
-    "libero_hdf5": LiberoHDF5Handler,
-    "libero_10": LiberoHDF5Handler,
-    "libero_90": LiberoHDF5Handler,
-    "libero_goal": LiberoHDF5Handler,
-    "libero_object": LiberoHDF5Handler,
-    "libero_spatial": LiberoHDF5Handler,
-    "so101_npz": SO101NPZHandler,
+    "so101_balanced_counterfactual": SO101BalancedCounterfactualHandler,
+    "cf_balanced": CFBalancedHandler,
 }
 
 
@@ -24,5 +18,5 @@ def get_handler_cls(dataset_name: str) -> Type[DomainHandler]:
     except KeyError:
         raise KeyError(
             f"No handler registered for dataset '{dataset_name}'. "
-            f"Add it to _REGISTRY in datasets/domain_handler/registry.py."
+            f"Available: {sorted(_REGISTRY)}."
         )

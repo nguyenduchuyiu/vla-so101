@@ -14,22 +14,88 @@ Key differences from FlorenceVLA:
 from __future__ import annotations
 
 import logging
-import traceback
-from typing import Any, Dict
+from typing import Callable, Dict
 
 import numpy as np
 import torch
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from PIL import Image
-import uvicorn
-import json_numpy
-import cv2
 
 from transformers import PreTrainedModel, AutoProcessor, AutoModelForImageTextToText
 from .transformer_smolvlm import SmolVLMActionTransformer
 from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
+
+
+def _sample_flow_time_and_noise(
+    action: torch.Tensor,
+    flow_group_id: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample SimVLA Beta(1.5, 1) times, independently or per group id."""
+    batch_size = action.shape[0]
+    if flow_group_id is None:
+        # Beta(alpha, 1) has inverse CDF u ** (1 / alpha).  Writing the
+        # sampler this way is exact for alpha=1.5 and works reliably on MPS.
+        t = torch.rand(batch_size, device=action.device).pow(2.0 / 3.0)
+        t = t * 0.999 + 0.001
+        return t, torch.randn_like(action)
+
+    group_ids = flow_group_id.to(device=action.device).reshape(-1)
+    if group_ids.numel() != batch_size:
+        raise ValueError(
+            f"flow_group_id must contain one id per sample, got "
+            f"{group_ids.numel()} ids for batch size {batch_size}"
+        )
+    _, inverse = torch.unique(group_ids, sorted=True, return_inverse=True)
+    num_groups = int(inverse.max().item()) + 1
+    group_t = torch.rand(num_groups, device=action.device).pow(2.0 / 3.0)
+    group_t = group_t * 0.999 + 0.001
+    group_noise = torch.randn(
+        num_groups,
+        *action.shape[1:],
+        device=action.device,
+        dtype=action.dtype,
+    )
+    return group_t[inverse], group_noise[inverse]
+
+
+def _flow_interpolate(
+    action: torch.Tensor, noise: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    """Linear flow path x_t=(1-t)*action+t*noise."""
+    t_expanded = t.reshape(-1, *([1] * (action.ndim - 1)))
+    return (1.0 - t_expanded) * action + t_expanded * noise
+
+
+def _flow_target_velocity(action: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+    """Constant oracle velocity dx_t/dt for the linear path."""
+    return noise - action
+
+
+def _flow_reconstruct_action(
+    x_t: torch.Tensor, velocity: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    """One-point estimate of x_0: action_hat=x_t-t*v_theta."""
+    t_expanded = t.reshape(-1, *([1] * (x_t.ndim - 1)))
+    return x_t - t_expanded * velocity
+
+
+def _euler_integrate_flow(
+    x_1: torch.Tensor,
+    steps: int,
+    velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Integrate the learned field from t=1 to t=0 with explicit Euler."""
+    steps = max(1, int(steps))
+    dt = -1.0 / steps
+    x_t = x_1
+    for step_idx in range(steps):
+        t = torch.full(
+            (x_t.shape[0],),
+            1.0 - step_idx / steps,
+            device=x_t.device,
+            dtype=x_t.dtype,
+        )
+        x_t = x_t + dt * velocity_fn(x_t, t)
+    return x_t
 
 
 class SmolVLMVLA(PreTrainedModel):
@@ -128,101 +194,7 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             logging.info("✓ Concat mode enabled: conditions concatenated to sequence")
 
-        # Deferred FastAPI app
-        self.app: FastAPI | None = None
-
     # ============================= SmolVLM encoder =============================
-    def forward_vlm(
-        self,
-        pixel_values: torch.FloatTensor,    # [B, V, C, H, W] - multi-view images
-        image_mask: torch.Tensor,           # [B, V] (bool or 0/1)
-        language_instruction: list[str] | None = None,  # Optional text prompts
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Encode multi-view images via SmolVLM2.
-        
-        All views are processed together by SmolVLM, producing unified features.
-        No aux_visual_inputs needed - everything goes through VLM.
-
-        Returns:
-          { "vlm_features": [B, T_enc, D] }
-        """
-        if pixel_values.dim() == 6:
-            if pixel_values.size(2) == 1:
-                pixel_values = pixel_values.squeeze(2)
-            else:
-                pixel_values = pixel_values[:, :, 0]
-            
-        B, V, C, H, W = pixel_values.shape
-        device = pixel_values.device
-        
-        # Prepare images for SmolVLM - flatten views and filter by mask
-        # SmolVLM can handle multiple images as part of multi-image inference
-        batch_features = []
-        
-        for b in range(B):
-            # Get valid images for this sample
-            valid_mask = image_mask[b].bool()
-            valid_images = pixel_values[b][valid_mask]  # [num_valid, C, H, W]
-            
-            if valid_images.shape[0] == 0:
-                raise ValueError("At least one image view must be valid per batch.")
-            
-            # Convert to PIL images for SmolVLM processor
-            pil_images = []
-            for img_tensor in valid_images:
-                # Denormalize and convert to PIL
-                img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
-                # Undo SmolVLM/SigLIP normalization.
-                img_np = img_np * 0.5 + 0.5
-                img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
-                pil_images.append(Image.fromarray(img_np))
-            
-            # Build message for SmolVLM with multiple images
-            content = []
-            for i, img in enumerate(pil_images):
-                content.append({"type": "image", "image": img})
-            
-            # Add text prompt if provided
-            if language_instruction is not None and b < len(language_instruction):
-                content.append({"type": "text", "text": language_instruction[b]})
-            else:
-                content.append({"type": "text", "text": "Describe the robot's observation."})
-            
-            messages = [{"role": "user", "content": content}]
-            
-            # Process with SmolVLM
-            inputs = self.vlm_processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            ).to(device)
-            
-            # Get encoder outputs (hidden states) instead of generating text
-            with torch.no_grad():
-                outputs = self.vlm(
-                    **inputs,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-            
-            # Use the last hidden state as features
-            # Shape: [1, seq_len, hidden_size]
-            hidden_states = outputs.hidden_states[-1]
-            batch_features.append(hidden_states.squeeze(0))  # [seq_len, hidden_size]
-        
-        # Pad to same length and stack
-        max_len = max(f.shape[0] for f in batch_features)
-        hidden_size = batch_features[0].shape[-1]
-        
-        padded_features = torch.zeros(B, max_len, hidden_size, device=device, dtype=batch_features[0].dtype)
-        for b, feat in enumerate(batch_features):
-            padded_features[b, :feat.shape[0]] = feat
-        
-        return {"vlm_features": padded_features}
-
     def forward_vlm_efficient(
         self,
         pixel_values: torch.FloatTensor,    # [B, V, C, H, W] - Already preprocessed
@@ -364,6 +336,7 @@ class SmolVLMVLA(PreTrainedModel):
         proprio: torch.Tensor,              # [B, dim_proprio]
         action: torch.Tensor,               # [B, T=num_actions, D=dim_action]
         language_attention_mask: torch.Tensor | None = None,
+        flow_group_id: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Flow Matching training.
@@ -380,10 +353,13 @@ class SmolVLMVLA(PreTrainedModel):
         B = input_ids.shape[0]
         device = input_ids.device
         
-        # Cover the complete ODE, including the action endpoint near t=0.
-        # Beta(1.5, 1) under-sampled that endpoint and produced low logged loss
-        # while the integrated SO-101 action remained inaccurate.
-        t = torch.rand(B, device=device) * 0.999 + 0.001
+        # Match SimVLA's high-noise-biased Beta(1.5, 1) time distribution.
+        # Branch-point overfit batches carry a group id for each paired
+        # counterfactual sample.  Sampling one t/noise tensor per group removes
+        # flow-matching randomness as a cue: paired samples differ only in the
+        # instruction and oracle action chunk.  Ordinary datasets omit the id
+        # and retain the original independent sampling behavior.
+        t, noise = _sample_flow_time_and_noise(action, flow_group_id)
 
         # Normalize the joint contract. Some spaces represent future commands
         # relative to the current proprioception.
@@ -406,10 +382,11 @@ class SmolVLMVLA(PreTrainedModel):
             proprio_norm = proprio
         
         # Flow Matching
-        noise = torch.randn_like(action_norm)
-        t_expanded = t.view(-1, 1, 1)
-        x_t = t_expanded * noise + (1 - t_expanded) * action_norm
-        u_t = noise - action_norm
+        # Noise was sampled in raw action shape above; normalization preserves
+        # the shape/dtype contract used by the flow objective.
+        noise = noise.to(dtype=action_norm.dtype)
+        x_t = _flow_interpolate(action_norm, noise, t)
+        u_t = _flow_target_velocity(action_norm, noise)
 
         # Model prediction (no aux_visual_inputs for SmolVLM)
         v_t = self.transformer(
@@ -470,91 +447,18 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
 
-        # Euler integration
-        steps = max(1, int(steps))
-        dt = -1.0 / steps
-        
-        x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
-        for step_idx in range(steps):
-            t = 1.0 - step_idx / steps
-            t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
-            v_t = self.transformer(
+        x_1 = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
+
+        def velocity_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            return self.transformer(
                 vlm_features=enc["vlm_features"],
                 action_with_noise=x_t,
                 proprio=proprio_norm,
-                t=t_tensor,
+                t=t,
             )
-        
-            x_t = x_t + dt * v_t
+
+        x_t = _euler_integrate_flow(x_1, steps, velocity_fn)
         
         if hasattr(self.action_space, "postprocess_with_proprio"):
             return self.action_space.postprocess_with_proprio(x_t, proprio)
         return self.action_space.postprocess(x_t)
-
-    # =============================== FastAPI service =============================
-    def _build_app(self, processor):
-        """Build FastAPI app for SmolVLM-VLA inference."""
-        if self.app is not None:
-            return
-
-        app = FastAPI()
-
-        @app.post("/act")
-        def act(payload: Dict[str, Any]):
-            try:
-                self.eval()
-                # Decode images
-                images = []
-                for key in ("image0", "image1", "image2"):
-                    if key not in payload:
-                        continue
-                    v = json_numpy.loads(payload[key])
-                    if isinstance(v, np.ndarray):
-                        if v.ndim == 1:
-                            v = cv2.imdecode(v, cv2.IMREAD_COLOR)
-                        images.append(Image.fromarray(v))
-                    elif isinstance(v, (list, tuple)):
-                        images.append(Image.fromarray(np.array(v)))
-                    elif isinstance(v, str):
-                        images.append(Image.open(v))
-                        
-                if not images:
-                    return JSONResponse({"error": "No valid images found."}, status_code=400)
-
-                # Process inputs
-                inputs = processor(images, payload["language_instruction"])
-                if not {"input_ids", "image_input", "image_mask"}.issubset(inputs):
-                    return JSONResponse({"error": "Processor returned incomplete inputs."}, status_code=400)
-
-                # Build proprio tensor
-                proprio = torch.as_tensor(np.asarray(json_numpy.loads(payload["proprio"])))
-
-                # Align to model device/dtype
-                device = next(self.parameters()).device
-                dtype = next(self.parameters()).dtype
-
-                def to_model(t: torch.Tensor) -> torch.Tensor:
-                    if not isinstance(t, torch.Tensor):
-                        t = torch.as_tensor(t)
-                    return t.to(device=device, dtype=dtype) if t.is_floating_point() else t.to(device=device)
-
-                inputs = {k: to_model(v) for k, v in inputs.items()}
-                inputs["proprio"] = to_model(proprio.unsqueeze(0))
-
-                # Inference
-                steps = int(payload.get("steps", 10))
-                action = self.generate_actions(**inputs, steps=steps).squeeze(0).float().cpu().numpy()
-                return JSONResponse({"action": action.tolist()})
-
-            except Exception:
-                logging.error(traceback.format_exc())
-                return JSONResponse({"error": "Request failed"}, status_code=400)
-
-        self.app = app
-
-    def run(self, processor, host: str = "0.0.0.0", port: int = 8000):
-        """Launch the FastAPI service."""
-        self._build_app(processor)
-        assert self.app is not None
-        uvicorn.run(self.app, host=host, port=port)
