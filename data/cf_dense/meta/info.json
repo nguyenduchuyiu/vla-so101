@@ -1,0 +1,44 @@
+{
+  "format": "cf_nominal_v1",
+  "dataset_kind": "counterfactual_nominal",
+  "num_objectives": 5,
+  "objective_colors": [
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "purple"
+  ],
+  "target_color": "white",
+  "num_scenes_requested": 2,
+  "num_scenes_saved": 1,
+  "total_episodes": 5,
+  "total_frames": 1719,
+  "image_shape": [
+    96,
+    96,
+    3
+  ],
+  "control_dt": 0.02,
+  "fps": 50,
+  "action_semantics": "absolute_joint_position",
+  "joint_order": [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper"
+  ],
+  "units": {
+    "observation.state[0:5]": "degrees",
+    "observation.state[5]": "gripper_percent_0_100"
+  },
+  "phase_names": [
+    "REACH_PICK",
+    "GRASP",
+    "REACH_PLACE",
+    "PLACE"
+  ],
+  "env_id": "MuJoCoCounterfactualPickAndPlace-v1"
+}

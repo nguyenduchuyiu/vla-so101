@@ -9,9 +9,7 @@ env/
 *.py[cod]
 
 # Data / outputs
-data/
 datasets/
-norm_stats/
 outputs/
 SimVLA/runs/
 runs/

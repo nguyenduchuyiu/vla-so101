@@ -1,0 +1,31 @@
+== cf_data smoke: out=/Users/nguyenduchuyiu/projects/vla-so101/data/cf_smoke_test scenes=1 max_anchors=3 ==
+scene 1/1 (scene_000000): saved 5 episodes
+saved 5 episodes across 1 scenes (0 failed objective attempts)
+anchors=12 branches=24 (nominal=12 cf=12) ratio_nominal=0.5 valid_cf_groups=225 rejected=0 n_rp=3
+samples_per_phase={'REACH_PICK': 15, 'GRASP': 3, 'REACH_PLACE': 3, 'PLACE': 3}
+samples_per_objective={'red': 4, 'blue': 5, 'green': 5, 'yellow': 4, 'purple': 6}
+PASS  criterion  1  five objectives
+    num_objectives=5
+PASS  criterion  2  objectives balanced over episodes
+    episodes_per_objective=[1, 1, 1, 1, 1]
+PASS  criterion  3  nominal samples balanced per phase
+    anchors(=nominal_branches)_per_phase={'REACH_PICK': 3, 'GRASP': 3, 'REACH_PLACE': 3, 'PLACE': 3} stats.samples_per_phase={'REACH_PICK': 15, 'GRASP': 3, 'REACH_PLACE': 3, 'PLACE': 3}
+PASS  criterion  4  CF anchor = 1 nominal + 4 CF
+    rp_groups=3 bad=[]
+PASS  criterion  5  branches share anchor state
+    checked 3 groups, mismatches=[]
+PASS  criterion  6  shared image + proprio at anchor
+    anchor_proprio==nominal_state[frame] for 3 groups; image read from nominal frame t by handler
+PASS  criterion  7  branch instruction + future match objective
+    checked 3 groups, violations=[]
+PASS  criterion  8  ~50/50 nominal/counterfactual
+    ratio=0.5 nominal=12 cf=12
+PASS  criterion  9  all branches retrievable from anchor_id
+    checked 12 anchors, mismatches=[]
+PASS  criterion 10  anchor branches not split across splits
+    checked 12 anchors, split_conflicts=[]
+PASS  criterion 11  action chunk consistent from future proprio
+    proprio==abs[0], action==future[:H], delta[:5]=future-current (H=10)
+PASS  criterion  0  eval_pairs == test REACH_PICK groups (output D)
+    eval_pairs=3 test_rp=3
+DATALOADER: keys=['action', 'flow_group_id', 'image_input', 'image_mask', 'language_instruction', 'proprio'] image_input=(10, 2, 3, 96, 96) action=(10, 10, 6) proprio=(10, 6) flow_group_id=[10, 11, 1, 1, 1, 1]

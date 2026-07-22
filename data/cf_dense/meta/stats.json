@@ -1,0 +1,38 @@
+{
+  "num_nominal_episodes": 5,
+  "num_scenes": 1,
+  "num_unique_anchors": 944,
+  "num_branches": 1888,
+  "num_cf_branches": 944,
+  "num_nominal_branches": 944,
+  "samples_per_phase": {
+    "REACH_PICK": 1180,
+    "GRASP": 236,
+    "REACH_PLACE": 236,
+    "PLACE": 236
+  },
+  "samples_per_objective": {
+    "red": 363,
+    "blue": 383,
+    "green": 388,
+    "yellow": 390,
+    "purple": 364
+  },
+  "nominal_counterfactual_ratio": 0.5,
+  "num_valid_cf_groups": 448,
+  "num_rejected_anchors": 0,
+  "n_rp_balanced": 236,
+  "candidate_phase_counts": {
+    "REACH_PICK": 448,
+    "GRASP": 282,
+    "REACH_PLACE": 302,
+    "PLACE": 236
+  },
+  "trajectory_length_distribution": {
+    "min": 323,
+    "max": 362,
+    "mean": 343.8
+  },
+  "horizon_stored": 32,
+  "anchor_stride": 2
+}
