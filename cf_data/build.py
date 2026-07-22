@@ -369,9 +369,9 @@ def build(args: argparse.Namespace) -> Path:
     # dataloader), so batch_size is unconstrained.
     training_meta = {
         "dataset_name": "cf_balanced",
-        "data_dir": str(in_dir),
+        "data_dir": str(args.in_dir),
         "datalist": [{"sampler": "cf_balanced"}],
-        "dataset_root": str(in_dir),
+        "dataset_root": str(args.in_dir),
         "anchors_file": "meta/anchors.jsonl",
         "horizon_stored": args.horizon,
         "disable_image_augmentation": True,

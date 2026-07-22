@@ -1,12 +1,12 @@
 {
   "dataset_name": "cf_balanced",
-  "data_dir": "/Users/nguyenduchuyiu/projects/vla-so101/data/cf_dense",
+  "data_dir": "data/cf_dense",
   "datalist": [
     {
       "sampler": "cf_balanced"
     }
   ],
-  "dataset_root": "/Users/nguyenduchuyiu/projects/vla-so101/data/cf_dense",
+  "dataset_root": "data/cf_dense",
   "anchors_file": "meta/anchors.jsonl",
   "horizon_stored": 32,
   "disable_image_augmentation": true,
