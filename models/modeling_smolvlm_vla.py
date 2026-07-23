@@ -207,6 +207,9 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             logging.info("✓ Concat mode enabled: conditions concatenated to sequence")
 
+        # Initialize weights and apply final processing (required for Transformers 5.x)
+        self.post_init()
+
     # ============================= SmolVLM encoder =============================
     def forward_vlm_efficient(
         self,
