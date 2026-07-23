@@ -115,15 +115,6 @@ class SmolVLMVLA(PreTrainedModel):
     config_class = SmolVLMVLAConfig
     base_model_prefix = "smolvlm_vla"
     supports_gradient_checkpointing = True
-    _tied_weights_keys = []
-
-    @property
-    def all_tied_weights_keys(self) -> list[str]:
-        return getattr(self, "_tied_weights_keys", [])
-
-    def _tie_weights(self):
-        if hasattr(self, "vlm") and hasattr(self.vlm, "tie_weights"):
-            self.vlm.tie_weights()
 
     def __init__(self, config: SmolVLMVLAConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
