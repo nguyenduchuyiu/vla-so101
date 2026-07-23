@@ -51,7 +51,6 @@ from cf_data.core import (
     step_physics,
 )
 from cf_data.env import ENV_ID
-from old_vla_data.oracle import Oracle
 
 PHASE_POOLS = (REACH_PICK, GRASP, REACH_PLACE, PLACE)
 

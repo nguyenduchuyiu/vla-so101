@@ -21,9 +21,8 @@ from so101_nexus.lerobot_dataset import (
 )
 
 from cf_data.collect import make_env
-from cf_data.core import OBJECTIVE_COLORS, Snapshot, objective_instruction, restore_snapshot
+from cf_data.core import OBJECTIVE_COLORS, Snapshot, get_gripper_limits, objective_instruction, restore_snapshot
 from models.utils import load_vla_for_inference, pick_device
-from old_vla_data.counterfactual_collector import _gripper_limits
 from simvla_datasets.utils import build_image_transform
 
 
@@ -136,7 +135,7 @@ def main() -> None:
     obs = env._get_obs()
 
     instruction = objective_instruction(args.objective_id)
-    limits = _gripper_limits(env)
+    limits = get_gripper_limits(env)
 
     print(f"Running rollout for instruction: {instruction}")
 

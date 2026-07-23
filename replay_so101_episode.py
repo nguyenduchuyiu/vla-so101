@@ -10,7 +10,8 @@ import numpy as np
 import mediapy as media
 from so101_nexus.lerobot_dataset import dataset_row_to_sim_qpos
 
-from old_vla_data.counterfactual_collector import _gripper_limits, _make_env
+from cf_data.collect import make_env
+from cf_data.core import get_gripper_limits
 
 
 def _episode_meta(episode_path: Path) -> dict:
@@ -48,12 +49,11 @@ def main() -> None:
     with np.load(args.episode) as episode:
         actions = episode["action"].copy()
 
-    env = _make_env(("red", "orange"), ("green", "white"),
-                    source_index, target_index, 256, 256)
+    env = make_env(256, 256, source_index, 0.0)
     try:
         obs, info = env.reset(seed=seed)
         frames = [np.concatenate([obs["overhead_camera"], obs["wrist_camera"]], axis=1)]
-        limits = _gripper_limits(env)
+        limits = get_gripper_limits(env)
         for action_row in actions:
             command = dataset_row_to_sim_qpos(action_row, gripper_limits_rad=limits)
             current = env.unwrapped.data.ctrl[env.unwrapped._actuator_ids].copy()

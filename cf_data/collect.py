@@ -20,6 +20,18 @@ import numpy as np
 from so101_nexus import CubeObject
 from so101_nexus.config import PickAndPlaceConfig
 
+from so101_nexus.observations import (
+    EndEffectorPose,
+    GraspState,
+    JointPositions,
+    ObjectOffset,
+    ObjectPose,
+    OverheadCamera,
+    TargetOffset,
+    TargetPosition,
+    WristCamera,
+)
+
 from cf_data.core import (
     OBJECTIVE_COLORS,
     TARGET_COLOR,
@@ -30,17 +42,29 @@ from cf_data.core import (
     stage_to_phase,
 )
 from cf_data.env import CFMultiObjectEnv, ENV_ID
-from old_vla_data.collector import _observations
-from old_vla_data.oracle import Oracle
 
 CONTROL_DT = 0.02
+
+
+def _observations(width: int, height: int):
+    return [
+        JointPositions(),
+        EndEffectorPose(),
+        GraspState(),
+        TargetPosition(),
+        ObjectPose(),
+        ObjectOffset(),
+        TargetOffset(),
+        WristCamera(width=width, height=height),
+        OverheadCamera(width=width, height=height),
+    ]
 
 
 def make_env(width: int, height: int, source_index: int, robot_init_qpos_noise: float) -> CFMultiObjectEnv:
     config = PickAndPlaceConfig(
         objects=[CubeObject(color=c) for c in OBJECTIVE_COLORS],
         target_colors=[TARGET_COLOR],
-        observations=_observations("pick_and_place", width, height),
+        observations=_observations(width, height),
         obs_mode="visual",
         goal_thresh=0.03,
     )

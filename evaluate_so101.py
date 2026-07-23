@@ -17,8 +17,7 @@ from so101_nexus.lerobot_dataset import (
 from models.utils import load_vla_for_inference, pick_device
 from simvla_datasets.utils import build_image_transform
 from cf_data.collect import make_env
-from cf_data.core import OBJECTIVE_COLORS, objective_instruction
-from old_vla_data.counterfactual_collector import _gripper_limits
+from cf_data.core import OBJECTIVE_COLORS, get_gripper_limits, objective_instruction
 
 
 def preprocess_images(
@@ -71,7 +70,7 @@ def main() -> None:
         obs, info = env.reset(seed=args.seed)
         env.set_objective(args.objective_id)
         instruction = args.instruction or objective_instruction(args.objective_id)
-        limits = _gripper_limits(env)
+        limits = get_gripper_limits(env)
         torch.manual_seed(args.seed if args.policy_seed is None else args.policy_seed)
 
         frames.append(

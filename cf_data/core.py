@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import Any
 
 import mujoco
 import numpy as np
@@ -42,6 +43,15 @@ STAGE_TO_PHASE: dict[str, int] = {
 
 # Gripper control range of the SO101 env equals sim_qpos_to_dataset_row's default
 # (rad(-10), rad(100)); we rely on the default so the row encoding is unambiguous.
+
+
+def get_gripper_limits(env: Any) -> tuple[float, float]:
+    """Extract gripper lower and upper joint limits in radians from SO101 env."""
+    u = env.unwrapped
+    return float(u._target_low[5]), float(u._target_high[5])
+
+
+_gripper_limits = get_gripper_limits
 
 
 def objective_instruction(objective_id: int) -> str:
