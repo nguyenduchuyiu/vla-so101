@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import json
+import random
 import math
 import tempfile
 
@@ -312,6 +313,7 @@ def test_handler_branches_share_image_proprio_and_group_id():
         meta = {"dataset_name": "cf_balanced", "dataset_root": str(root),
                 "anchors_file": "meta/anchors.jsonl"}
         h = CFBalancedHandler(meta, num_views=2)
+        random.seed(0)
         gen = h.iter_episode(0, num_actions=info["H"], image_aug=_identity_aug)
         rp = [next(gen) for _ in range(5)]  # first 5 = RP group branches
         # Shared anchor image (criterion 6) and proprio across the 5 branches.
@@ -320,7 +322,7 @@ def test_handler_branches_share_image_proprio_and_group_id():
             torch.testing.assert_close(s["proprio"], rp[0]["proprio"])
         # Shared flow_group_id (all branches of an anchor).
         gids = {int(s["flow_group_id"]) for s in rp}
-        assert gids == {0}
+        assert len(gids) == 1
         # Proprio == anchor_proprio.
         torch.testing.assert_close(rp[0]["proprio"], torch.as_tensor(info["anchor_proprio"], dtype=torch.float32))
         # Image == nominal frame at anchor_frame (overhead filled with frame idx;

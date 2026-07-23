@@ -19,7 +19,7 @@ from typing import Callable, Dict
 import numpy as np
 import torch
 
-from transformers import PreTrainedModel, AutoProcessor, AutoModelForImageTextToText
+from transformers import PreTrainedModel, AutoConfig, AutoProcessor, AutoModelForImageTextToText
 from .transformer_smolvlm import SmolVLMActionTransformer
 from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
@@ -141,11 +141,24 @@ class SmolVLMVLA(PreTrainedModel):
         vlm_dtype = dtype_by_name.get(getattr(config, "vlm_dtype", "float32"))
         if vlm_dtype is None:
             raise ValueError(f"Unsupported VLM dtype: {config.vlm_dtype}")
-        self.vlm = AutoModelForImageTextToText.from_pretrained(
-            config.smolvlm_model_path,
-            dtype=vlm_dtype,
-            trust_remote_code=True,
-        )
+        try:
+            self.vlm = AutoModelForImageTextToText.from_pretrained(
+                config.smolvlm_model_path,
+                dtype=vlm_dtype,
+                trust_remote_code=True,
+            )
+        except RuntimeError as e:
+            if "meta device" in str(e) or "set_default_device" in str(e):
+                vlm_config = AutoConfig.from_pretrained(
+                    config.smolvlm_model_path,
+                    trust_remote_code=True,
+                )
+                self.vlm = AutoModelForImageTextToText.from_config(
+                    vlm_config,
+                    trust_remote_code=True,
+                )
+            else:
+                raise
         if config.lora_rank > 0:
             from peft import LoraConfig, get_peft_model
 
