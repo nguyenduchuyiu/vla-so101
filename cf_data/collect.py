@@ -42,6 +42,7 @@ from cf_data.core import (
     stage_to_phase,
 )
 from cf_data.env import CFMultiObjectEnv, ENV_ID
+from vla_data.oracle import Oracle
 
 CONTROL_DT = 0.02
 

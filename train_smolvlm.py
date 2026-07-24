@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
+from tqdm import tqdm
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from simvla_datasets import create_smolvlm_dataloader
@@ -119,8 +120,12 @@ def get_args_parser():
 
     # Schedule
     parser.add_argument("--iters", type=int, default=10000)
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="If set, train this many epochs with a tqdm bar; one epoch = "
+                             "num_branches // batch_size steps. Overrides --iters and drives "
+                             "the LR schedule total = epochs * steps_per_epoch.")
     parser.add_argument("--freeze_steps", type=int, default=1000)
-    parser.add_argument("--warmup_steps", type=int, default=2000)
+    parser.add_argument("--warmup_steps", type=int, default=2000) 
     parser.add_argument("--use_cosine_decay", action="store_true", default=False)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
 
@@ -186,6 +191,33 @@ def set_seed(seed: int):
     np.random.seed(seed)
     random.seed(seed)
     cudnn.benchmark = True
+
+
+def _samples_per_epoch(metas_path: str) -> int:
+    """Total samples in one pass = sum of num_branches across the training metas.
+
+    The cf_balanced stream is infinite, so an epoch is defined as one shuffled
+    pass over the anchors = num_branches yielded samples. Used to size the tqdm
+    bar and the LR schedule when --epochs is set.
+    """
+    p = Path(metas_path)
+    if p.is_dir():
+        files = sorted(p.glob("*.json"))
+    elif p.suffix == ".json":
+        content = json.loads(p.read_text())
+        files = [Path(f) for f in content] if isinstance(content, list) else [p]
+    else:
+        files = [p]
+    total = 0
+    for f in files:
+        meta = json.loads(Path(f).read_text())
+        total += int(meta.get("num_branches", 0))
+    if total <= 0:
+        raise ValueError(
+            f"could not determine dataset size from {metas_path}; "
+            "set num_branches in the meta or use --iters"
+        )
+    return total
 
 
 def build_optimizer(model: SmolVLMVLA, lr: float, weight_decay: float, betas=(0.9, 0.95), lr_coef_vlm=1.0):
@@ -442,6 +474,14 @@ def main(args):
         betas=tuple(args.betas),
         lr_coef_vlm=args.learning_coef,
     )
+    if args.epochs:
+        samples = _samples_per_epoch(args.train_metas_path)
+        batches_per_epoch = max(1, samples // args.batch_size)
+        args.iters = args.epochs * batches_per_epoch
+        logger.info(
+            f"Epoch mode: {args.epochs} epochs x {batches_per_epoch} batches/epoch "
+            f"({samples} samples, batch_size={args.batch_size}) = {args.iters} steps"
+        )
     optimizer_restored = False
     if args.resume and load_path and os.path.isdir(load_path):
         optimizer_restored = load_optimizer_state(optim, load_path)
@@ -459,44 +499,55 @@ def main(args):
     if args.freeze_vlm:
         model.vlm.eval()
     
-    start_step = 0
+    # On resume we reload weights + optimizer state (above) but start a FRESH LR
+    # schedule over this invocation's args.iters. DAgger finetune rounds each run
+    # their own warmup+cosine, so global_step must NOT carry over from the
+    # checkpoint -- a stale step would either skip the loop (start_step >= iters)
+    # or pin the cosine LR at min_lr with no warmup.
+    global_step, t0 = 0, time.time()
     if args.resume and load_path and os.path.isdir(load_path):
-        state_json = os.path.join(load_path, "state.json")
-        if os.path.exists(state_json):
-            try:
-                with open(state_json, "r") as f:
-                    start_step = int(json.load(f).get("global_step", 0))
-                logger.info(f"Resuming from step: {start_step}")
-            except Exception:
-                pass
-    
-    global_step, t0 = start_step, time.time()
-    logger.info(f"🚀 Start SmolVLM-VLA training for {args.iters} iterations")
+        logger.info(f"Resumed weights/optimizer from {load_path}; LR schedule restarted at step 0 for {args.iters} steps")
+    logger.info(f"🚀 Start SmolVLM-VLA training for {args.iters} steps")
     logger.info(
         f"   world_size={accelerator.num_processes} "
         f"global_batch_size={args.batch_size * accelerator.num_processes}"
     )
 
-    for batch in train_dataloader:
+    # The cf_balanced dataloader is an infinite stream, so drive it with next()
+    # and a tqdm bar sized to the total step count. In epoch mode the bar label
+    # tracks the current epoch (one epoch = num_branches // batch_size steps).
+    batches_per_epoch = (args.iters // args.epochs) if args.epochs else 0
+    data_iter = iter(train_dataloader)
+    pbar = tqdm(
+        total=args.iters,
+        desc=("train" if not args.epochs else f"train epoch 1/{args.epochs}"),
+        disable=not accelerator.is_main_process,
+    )
+    cur_epoch = 1
+    while global_step < args.iters:
+        batch = next(data_iter)
         # Encode language
         lang = processor.encode_language(batch["language_instruction"])
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
         inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
-        
+
         # Update LR
         update_group_lrs(optim, global_step, args)
 
         # Forward
         loss_dict: Dict[str, torch.Tensor] = model(**inputs)
         loss = sum(loss_dict.values())
-        
+
         # Backward
         accelerator.backward(loss)
         if args.max_grad_norm:
             accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optim.step()
         optim.zero_grad()
+
+        global_step += 1
+        pbar.update(1)
 
         # Logging
         if global_step % args.log_interval == 0:
@@ -515,9 +566,14 @@ def main(args):
                     f"lr_action={logs['lr_action_heads']:.2e} "
                     f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
                 )
-        
+                pbar.set_postfix(loss=f"{logs['loss_total']:.4f}")
+
+        # Epoch label update (epoch mode only)
+        if batches_per_epoch and global_step % batches_per_epoch == 0 and global_step < args.iters:
+            cur_epoch += 1
+            pbar.set_description(f"train epoch {cur_epoch}/{args.epochs}")
+
         # Checkpointing
-        global_step += 1
         should_save = global_step == args.iters or global_step % args.save_interval == 0
         if should_save:
             accelerator.wait_for_everyone()
@@ -537,10 +593,8 @@ def main(args):
                     )
         if should_save:
             accelerator.wait_for_everyone()
-                    
-        if global_step >= args.iters:
-            break
 
+    pbar.close()
     accelerator.end_training()
 
 

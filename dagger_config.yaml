@@ -1,0 +1,97 @@
+# Single source of truth for the DAgger pipeline (run_dagger.py).
+# Edit this file; do not pass CLI flags to run_dagger.py.
+#
+# Every run collects FRESH data from scratch (oracle rollouts + DAgger
+# off-manifold frames). Only run.base_ckpt is an optional warm-start.
+# Norm stats are recomputed per iter from the actual built data pool
+# into paths.norm_stats/ (see `norm:` and run_dagger.py).
+
+run:
+  iterations: 3              # DAgger outer iterations (rollout+collect+train)
+  out_root: runs/dagger      # training output root (runs/dagger/iterNN/)
+  data_root: data/dagger     # rollout + bootstrap + merged data root
+  overwrite: true
+  base_ckpt: null            # optional ckpt to warm-start iter 0; null = scratch
+
+# iter 0: fresh expert rollout (cf_data.collect + cf_data.build normal, with CF).
+# Replaces the prebuilt data/cf_dense -- no existing dataset is reused.
+bootstrap:
+  scenes: 1
+  seed: 0
+  width: 256
+  height: 256
+  robot_noise: 0.0
+  build:
+    horizon: 32
+    anchor_stride: 1
+    max_anchors: null        # null = build.py default (all anchors)
+    seed: 0
+
+# iter>=1: model closed-loop rollout (dagger_collect.py).
+rollout:
+  scenes: 1
+  seed: 0                   # same scenes every iter (DAgger revisits trained distribution)
+  execute_steps: 1           # chunk actions executed per replan
+  max_replans: 400
+  width: 256
+  height: 256
+  policy_seed: 0
+
+# Off-manifold threshold detection (teacher-forcing vs closed-loop).
+# t* = first control step where closed-loop trackMAE (arm, deg) exceeds the
+# threshold for `persist_steps` consecutive steps. Frames [t*:] are off-manifold
+# and become DAgger anchors; frames before t* are on-manifold and skipped.
+offmanifold:
+  track_mae_threshold_deg: 5.0
+  persist_steps: 2
+  min_offmanifold_frames: 4  # skip scene if fewer off-manifold frames than this
+  tf_stride: 5               # teacher-forcing chunkMAE cadence (probe report only)
+
+# build.py --dagger on the off-manifold anchors (fresh oracle future chunk).
+dagger_build:
+  horizon: 32
+
+# Normalization stats: recomputed each iter from the built data pool
+# (cf_data.compute_norm_stats over meta/cf_balanced.json). Written to
+# paths.norm_stats/iterNN_norm.json and reused as the next iter's inference norm.
+norm:
+  max_samples: 10000
+
+train:
+  epochs: 3
+  batch_size: 8
+  learning_rate: 1.0e-4            # iter 0 (scratch/bootstrap from base_ckpt)
+  finetune_learning_rate: 3.0e-5   # iter>=1 DAgger finetune (gentle, warm-start)
+  learning_coef: 1.0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  warmup_steps: 10
+  freeze_steps: 0
+  min_lr_ratio: 0.1
+  use_cosine_decay: true
+  save_interval: 50
+  log_interval: 20
+  train_seed: 0
+  num_workers: 0
+  gradient_checkpointing: false
+  # model architecture -- must match run.base_ckpt (train errors otherwise).
+  model:
+    smolvlm_model_path: HuggingFaceTB/SmolVLM-500M-Instruct
+    action_mode: so101_delta
+    num_actions: 10
+    num_views: 2
+    image_size: 384
+    hidden_size: 768
+    depth: 12
+    num_heads: 12
+    lora_rank: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+
+launch:
+  num_processes: 1
+  mixed_precision: false   
+  main_process_port: 29505
+
+paths:
+  norm_stats: norm_stats    # dir; per-iter norm files written here (auto-computed)
