@@ -18,6 +18,8 @@ import signal
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
+
 from so101_nexus import CubeObject
 from so101_nexus.config import PickAndPlaceConfig
 
@@ -157,53 +159,53 @@ def collect(args: argparse.Namespace) -> Path:
 
         scene_episodes: list[tuple[list[dict], dict]] = []
         scene_failed = False
-        for source_id in range(NUM_OBJECTIVES):
-            for target_id in range(NUM_TARGETS):
-                restore_snapshot(env, s0)
-                env.set_objective(source_id, target_id)
-                oracle = Oracle(ENV_ID, env)
-                ep_id = f"{scene_id}_s{source_id}_t{target_id}"
-                try:
-                    frames, info, success = _collect_objective(env, oracle, max_steps)
-                except RuntimeError as exc:
-                    failures.append({"scene_id": scene_id, "source_id": source_id, "target_id": target_id, "error": str(exc)})
-                    scene_failed = True
-                    break
-                if not success or len(frames) < 8:
-                    failures.append(
-                        {
-                            "scene_id": scene_id,
-                            "source_id": source_id,
-                            "target_id": target_id,
-                            "success": success,
-                            "num_frames": len(frames),
-                        }
-                    )
-                    scene_failed = True
-                    break
-                scene_episodes.append(
-                    (
-                        frames,
-                        {
-                            "scene_id": scene_id,
-                            "initial_state_id": initial_state_id,
-                            "scene_index": scene_index,
-                            "episode_id": ep_id,
-                            "objective_id": source_id,
-                            "source_id": source_id,
-                            "objective_color": OBJECTIVE_COLORS[source_id],
-                            "target_id": target_id,
-                            "target_color": TARGET_COLORS[target_id],
-                            "instruction": instruction(source_id, target_id, variant_for(ep_id)),
-                            "is_counterfactual": False,
-                            "success": success,
-                            "num_frames": len(frames),
-                            "final_obj_to_target_dist": float(info.get("obj_to_target_dist", float("nan"))),
-                        },
-                    )
-                )
-            if scene_failed:
+        for source_id, target_id in tqdm(
+            [(s, t) for s in range(NUM_OBJECTIVES) for t in range(NUM_TARGETS)],
+            desc=f"scene {scene_index + 1}/{args.scenes} ({scene_id})", leave=False,
+        ):
+            restore_snapshot(env, s0)
+            env.set_objective(source_id, target_id)
+            oracle = Oracle(ENV_ID, env)
+            ep_id = f"{scene_id}_s{source_id}_t{target_id}"
+            try:
+                frames, info, success = _collect_objective(env, oracle, max_steps)
+            except RuntimeError as exc:
+                failures.append({"scene_id": scene_id, "source_id": source_id, "target_id": target_id, "error": str(exc)})
+                scene_failed = True
                 break
+            if not success or len(frames) < 8:
+                failures.append(
+                    {
+                        "scene_id": scene_id,
+                        "source_id": source_id,
+                        "target_id": target_id,
+                        "success": success,
+                        "num_frames": len(frames),
+                    }
+                )
+                scene_failed = True
+                break
+            scene_episodes.append(
+                (
+                    frames,
+                    {
+                        "scene_id": scene_id,
+                        "initial_state_id": initial_state_id,
+                        "scene_index": scene_index,
+                        "episode_id": ep_id,
+                        "objective_id": source_id,
+                        "source_id": source_id,
+                        "objective_color": OBJECTIVE_COLORS[source_id],
+                        "target_id": target_id,
+                        "target_color": TARGET_COLORS[target_id],
+                        "instruction": instruction(source_id, target_id, variant_for(ep_id)),
+                        "is_counterfactual": False,
+                        "success": success,
+                        "num_frames": len(frames),
+                        "final_obj_to_target_dist": float(info.get("obj_to_target_dist", float("nan"))),
+                    },
+                )
+            )
 
         if scene_failed:
             continue

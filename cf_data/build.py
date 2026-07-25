@@ -46,6 +46,7 @@ import signal
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 from cf_data.collect import make_env
 from cf_data.core import (
@@ -180,7 +181,7 @@ def _filter_rp(
     """Keep REACH_PICK candidates whose non-anchor sources all plan successfully
     (target fixed = the episode's target_id)."""
     valid: list[tuple[int, int, int]] = []
-    for ep_idx, t, obj_id in rp_candidates:
+    for ep_idx, t, obj_id in tqdm(rp_candidates, desc="filter REACH_PICK", leave=False):
         ep = episodes[ep_idx]
         tgt = ep["meta"]["target_id"]
         snap = Snapshot(ep["snap_qpos"][t], ep["snap_qvel"][t], ep["snap_ctrl"][t])
@@ -195,7 +196,7 @@ def _filter_place(
     """Keep REACH_PLACE candidates whose non-anchor targets all plan successfully
     (source fixed = the episode's source_id)."""
     valid: list[tuple[int, int, int]] = []
-    for ep_idx, t, obj_id in place_candidates:
+    for ep_idx, t, obj_id in tqdm(place_candidates, desc="filter REACH_PLACE", leave=False):
         ep = episodes[ep_idx]
         src = ep["meta"]["objective_id"]
         tgt = ep["meta"]["target_id"]

@@ -215,7 +215,7 @@ def main() -> None:
                 "--robot-noise", str(boot["robot_noise"]),
                 "--overwrite",
             ]
-            run_cmd(collect_cmd, run_dir / "collect.log", "iter 0: expert rollout (collect.py)")
+            run_cmd(collect_cmd, None, "iter 0: expert rollout (collect.py)")
 
             bcmd = [
                 sys.executable, "-m", "cf_data.build",
@@ -227,7 +227,7 @@ def main() -> None:
             ]
             if boot["build"]["max_anchors"] is not None:
                 bcmd += ["--max-anchors", str(boot["build"]["max_anchors"])]
-            run_cmd(bcmd, run_dir / "build.log", "iter 0: build CF anchors (build.py normal)")
+            run_cmd(bcmd, None, "iter 0: build CF anchors (build.py normal)")
             train_meta = bootstrap_dir / "meta" / "cf_balanced.json"
         else:
             # 1. rollout model closed-loop + locate off-manifold threshold t*
