@@ -18,10 +18,13 @@ import numpy as np
 
 from so101_nexus.lerobot_dataset import sim_qpos_to_dataset_row
 
-# 5 language objectives: one per source cube. The shared target color is fixed.
+# 5 source cubes (pick objectives) + K place targets. Source and target color sets
+# are disjoint so the instruction "pick up the {src} block ... on the {tgt} target"
+# names two unambiguous colors.
 OBJECTIVE_COLORS: tuple[str, ...] = ("red", "blue", "green", "yellow", "purple")
-TARGET_COLOR: str = "white"
+TARGET_COLORS: tuple[str, ...] = ("white", "black", "orange")
 NUM_OBJECTIVES: int = len(OBJECTIVE_COLORS)
+NUM_TARGETS: int = len(TARGET_COLORS)
 
 PHASE_NAMES: tuple[str, ...] = ("REACH_PICK", "GRASP", "REACH_PLACE", "PLACE")
 REACH_PICK: int = 0
@@ -54,9 +57,32 @@ def get_gripper_limits(env: Any) -> tuple[float, float]:
 _gripper_limits = get_gripper_limits
 
 
-def objective_instruction(objective_id: int) -> str:
-    """Language instruction for one objective (names the source cube color)."""
-    return f"pick up the {OBJECTIVE_COLORS[objective_id]} block and place it on the {TARGET_COLOR} target"
+# Paraphrase templates. Within a counterfactual group ONE variant is chosen (via
+# `variant_for`) and applied to every branch, so branches differ ONLY in the
+# swapped color word -- the contrast stays semantic, not lexical.
+_INSTRUCTION_TEMPLATES: tuple[str, ...] = (
+    "pick up the {src} block and place it on the {tgt} target",
+    "grab the {src} cube and put it onto the {tgt} pad",
+    "take the {src} block and drop it on the {tgt} target",
+    "move the {src} cube to the {tgt} target",
+    "retrieve the {src} block and set it down on the {tgt} pad",
+)
+NUM_VARIANTS: int = len(_INSTRUCTION_TEMPLATES)
+
+
+def variant_for(seed_str: str) -> int:
+    """Deterministic instruction-template variant in [0, NUM_VARIANTS) from a string.
+
+    Uses md5 (stable across processes), unlike Python's randomized `hash()`.
+    """
+    return int(short_hash(seed_str), 16) % NUM_VARIANTS
+
+
+def instruction(source_id: int, target_id: int, variant: int = 0) -> str:
+    """Language instruction for a (source, target) objective, naming both colors."""
+    return _INSTRUCTION_TEMPLATES[variant % NUM_VARIANTS].format(
+        src=OBJECTIVE_COLORS[source_id], tgt=TARGET_COLORS[target_id]
+    )
 
 
 def stage_to_phase(stage_name: str) -> int:

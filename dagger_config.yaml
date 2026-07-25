@@ -7,7 +7,7 @@
 # into paths.norm_stats/ (see `norm:` and run_dagger.py).
 
 run:
-  iterations: 3              # DAgger outer iterations (rollout+collect+train)
+  iterations: 2              # DAgger outer iterations (rollout+collect+train)
   out_root: runs/dagger      # training output root (runs/dagger/iterNN/)
   data_root: data/dagger     # rollout + bootstrap + merged data root
   overwrite: true
@@ -16,23 +16,23 @@ run:
 # iter 0: fresh expert rollout (cf_data.collect + cf_data.build normal, with CF).
 # Replaces the prebuilt data/cf_dense -- no existing dataset is reused.
 bootstrap:
-  scenes: 1
+  scenes: 3                 # 3 S0 inits x 15 (s,t) = 45 oracle rollouts; generalization needs >1 init
   seed: 0
   width: 256
   height: 256
   robot_noise: 0.0
   build:
     horizon: 32
-    anchor_stride: 1
-    max_anchors: null        # null = build.py default (all anchors)
+    anchor_stride: 4         # 15 eps/scene -> ~2625 REACH_PICK candidates; stride 4 cuts IK-filter cost ~4x
+    max_anchors: 300         # cap n_rp -> ~3000 branches, ~375 steps/epoch; sampled across 3 scenes for S0 diversity
     seed: 0
 
 # iter>=1: model closed-loop rollout (dagger_collect.py).
 rollout:
-  scenes: 1
+  scenes: 3
   seed: 0                   # same scenes every iter (DAgger revisits trained distribution)
-  execute_steps: 1           # chunk actions executed per replan
-  max_replans: 400
+  execute_steps: 5           # 5 steps/replan -> 80x5=400 control steps reaches PLACE (execute_steps=1 gave only 250, never reached place); matches eval deployment
+  max_replans: 80           # 80x5=400 steps = full pick+place; t*=2 gives ~148 off-manifold frames/obj
   width: 256
   height: 256
   policy_seed: 0
@@ -45,7 +45,7 @@ offmanifold:
   track_mae_threshold_deg: 5.0
   persist_steps: 2
   min_offmanifold_frames: 4  # skip scene if fewer off-manifold frames than this
-  tf_stride: 5               # teacher-forcing chunkMAE cadence (probe report only)
+  tf_stride: 20              # teacher-forcing chunkMAE cadence (probe report only; t* uses closed-loop trackMAE, not TF -> cut cost 4x)
 
 # build.py --dagger on the off-manifold anchors (fresh oracle future chunk).
 dagger_build:
@@ -58,7 +58,7 @@ norm:
   max_samples: 10000
 
 train:
-  epochs: 3
+  epochs: 5                 # 15 (s,t) meanings x 5 templates need >1 epoch to bind instruction->action
   batch_size: 8
   learning_rate: 1.0e-4            # iter 0 (scratch/bootstrap from base_ckpt)
   finetune_learning_rate: 3.0e-5   # iter>=1 DAgger finetune (gentle, warm-start)

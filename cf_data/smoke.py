@@ -23,7 +23,14 @@ import torch
 
 from cf_data.build import build as build_fn
 from cf_data.collect import collect as collect_fn
-from cf_data.core import OBJECTIVE_COLORS, REACH_PICK, objective_instruction
+from cf_data.core import (
+    NUM_OBJECTIVES,
+    NUM_TARGETS,
+    REACH_PICK,
+    REACH_PLACE,
+    instruction,
+    variant_for,
+)
 from models.action_hub import SO101DeltaActionSpace
 from simvla_datasets.dataset_smolvlm import create_smolvlm_dataloader
 from simvla_datasets.utils import action_slice
@@ -50,16 +57,17 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
     stats = json.loads((out / "meta" / "stats.json").read_text())
     nominal_metas = _load_jsonl(out / "meta" / "nominal_episodes.jsonl")
 
-    # 1. Five objectives.
-    ok = info["num_objectives"] == 5 and len(OBJECTIVE_COLORS) == 5
-    _check(1, "five objectives", ok, f"num_objectives={info['num_objectives']}", log, results)
+    # 1. Five objectives + three targets.
+    ok = info["num_objectives"] == NUM_OBJECTIVES and info.get("num_targets") == NUM_TARGETS
+    _check(1, "objectives + targets", ok,
+           f"num_objectives={info['num_objectives']} num_targets={info.get('num_targets')}", log, results)
 
     # 2. Objective distribution balanced across nominal episodes.
     per_obj = {}
     for m in nominal_metas:
         per_obj[m["objective_id"]] = per_obj.get(m["objective_id"], 0) + 1
-    counts = [per_obj.get(j, 0) for j in range(5)]
-    ok = len(per_obj) == 5 and max(counts) - min(counts) <= 1
+    counts = [per_obj.get(j, 0) for j in range(NUM_OBJECTIVES)]
+    ok = len(per_obj) == NUM_OBJECTIVES and max(counts) - min(counts) <= 1
     _check(2, "objectives balanced over episodes", ok, f"episodes_per_objective={counts}", log, results)
 
     # 3. Nominal samples balanced across the 4 phases. Each anchor contributes exactly
@@ -74,16 +82,22 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
     _check(3, "nominal samples balanced per phase", ok,
            f"anchors(=nominal_branches)_per_phase={anchors_per_phase} stats.samples_per_phase={stats['samples_per_phase']}", log, results)
 
-    # 4. Each CF anchor = 1 nominal + 4 CF branches.
+    # 4. CF groups: REACH_PICK = 1 nominal + (NUM_OBJECTIVES-1) CF; REACH_PLACE = 1 nominal + (NUM_TARGETS-1) CF.
     rp = [a for a in anchors if a["phase"] == REACH_PICK]
+    place = [a for a in anchors if a["phase"] == REACH_PLACE]
     bad = []
     for a in rp:
         npz = np.load(out / a["cf_path"])
         cf = npz["is_counterfactual"]
-        if a["n_branches"] != 5 or int(cf.sum()) != 4 or int((~cf).sum()) != 1:
+        if a["n_branches"] != NUM_OBJECTIVES or int(cf.sum()) != NUM_OBJECTIVES - 1 or int((~cf).sum()) != 1:
             bad.append(a["anchor_id"])
-    _check(4, "CF anchor = 1 nominal + 4 CF", len(rp) > 0 and not bad,
-           f"rp_groups={len(rp)} bad={bad[:3]}", log, results)
+    for a in place:
+        npz = np.load(out / a["cf_path"])
+        cf = npz["is_counterfactual"]
+        if a["n_branches"] != NUM_TARGETS or int(cf.sum()) != NUM_TARGETS - 1 or int((~cf).sum()) != 1:
+            bad.append(a["anchor_id"])
+    _check(4, "CF groups: RP 1+(O-1), PLACE 1+(K-1)", len(rp) > 0 and len(place) > 0 and not bad,
+           f"rp_groups={len(rp)} place_groups={len(place)} bad={bad[:3]}", log, results)
 
     # 5. Branches of a group start from the same state (shared anchor_proprio == nominal state[frame]).
     bad = []
@@ -109,25 +123,30 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
     _check(6, "shared image + proprio at anchor", not bad,
            f"anchor_proprio==nominal_state[frame] for {len(rp)} groups; image read from nominal frame t by handler", log, results)
 
-    # 7. Each branch has instruction + future matching its objective (CF futures diverge from nominal).
+    # 7. Each branch instruction is a valid paraphrase of its (source,target) and CF futures diverge from nominal.
     bad = []
-    for a in rp:
+    for a in rp + place:
         npz = np.load(out / a["cf_path"])
-        obj_ids = npz["objective_ids"]
         futures = npz["future_chunks"]
-        nominal_future = futures[int(np.where(~npz["is_counterfactual"])[0][0])]
-        for j in range(5):
-            if a["branches"][j]["instruction"] != objective_instruction(int(obj_ids[j])):
+        cf_flags = npz["is_counterfactual"]
+        nominal_idx = int(np.where(~cf_flags)[0][0])
+        nominal_future = futures[nominal_idx]
+        expected_variant = variant_for(a["anchor_id"])
+        for j, br in enumerate(a["branches"]):
+            expected = instruction(br["source_id"], br["target_id"], expected_variant)
+            if br["instruction"] != expected:
                 bad.append((a["anchor_id"], "instruction", j))
-            if j != int(np.where(~npz["is_counterfactual"])[0][0]) and np.allclose(futures[j], nominal_future, atol=1e-5):
+            if j != nominal_idx and np.allclose(futures[j], nominal_future, atol=1e-5):
                 bad.append((a["anchor_id"], "cf==nominal", j))
     _check(7, "branch instruction + future match objective", not bad,
-           f"checked {len(rp)} groups, violations={bad[:3]}", log, results)
+           f"checked {len(rp) + len(place)} groups, violations={bad[:3]}", log, results)
 
-    # 8. ~50/50 nominal/counterfactual ratio.
+    # 8. nominal/total = 4/(NUM_OBJECTIVES + NUM_TARGETS + 2) (=0.4 for 5 sources, 3 targets):
+    #    4 nominal branches/anchor (one per phase) vs (O-1)+(K-1) CF branches/anchor.
+    expected_ratio = 4.0 / (NUM_OBJECTIVES + NUM_TARGETS + 2)
     ratio = stats["nominal_counterfactual_ratio"]
-    _check(8, "~50/50 nominal/counterfactual", abs(ratio - 0.5) <= 0.05,
-           f"ratio={ratio} nominal={stats['num_nominal_branches']} cf={stats['num_cf_branches']}", log, results)
+    _check(8, f"nominal/total ~ {expected_ratio:.2f}", abs(ratio - expected_ratio) <= 0.02,
+           f"ratio={ratio} expected={expected_ratio:.4f} nominal={stats['num_nominal_branches']} cf={stats['num_cf_branches']}", log, results)
 
     # 9. All branches retrievable from anchor_id.
     bad = []
@@ -165,11 +184,11 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
     _check(11, "action chunk consistent from future proprio", ok,
            f"proprio==abs[0], action==future[:H], delta[:5]=future-current (H={H})", log, results)
 
-    # eval_pairs == test-split RP groups (output D).
-    test_rp = [a for a in anchors if a["split"] == "test" and a["phase"] == REACH_PICK]
-    eval_ok = len(eval_pairs) == len(test_rp) and {e["anchor_id"] for e in eval_pairs} == {a["anchor_id"] for a in test_rp}
-    _check(0, "eval_pairs == test REACH_PICK groups (output D)", eval_ok,
-           f"eval_pairs={len(eval_pairs)} test_rp={len(test_rp)}", log, results)
+    # eval_pairs == test-split REACH_PICK + REACH_PLACE CF groups (output D).
+    test_cf = [a for a in anchors if a["split"] == "test" and a["phase"] in (REACH_PICK, REACH_PLACE)]
+    eval_ok = len(eval_pairs) == len(test_cf) and {e["anchor_id"] for e in eval_pairs} == {a["anchor_id"] for a in test_cf}
+    _check(0, "eval_pairs == test REACH_PICK+REACH_PLACE groups (output D)", eval_ok,
+           f"eval_pairs={len(eval_pairs)} test_cf={len(test_cf)}", log, results)
 
     return results, {"stats": stats, "anchors": anchors, "out": out}
 
@@ -219,7 +238,7 @@ def main() -> None:
         with redirect_stdout(log):
             collect_fn(cargs)
         bargs = argparse.Namespace(in_dir=out, horizon=32, anchor_stride=args.anchor_stride,
-                                    max_anchors=args.max_anchors, seed=args.seed, overwrite=True)
+                                    max_anchors=args.max_anchors, seed=args.seed, overwrite=True, dagger=False)
         with redirect_stdout(log):
             build_fn(bargs)
     except Exception as exc:  # noqa: BLE001 -- surface any pipeline failure

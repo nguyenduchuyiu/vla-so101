@@ -251,7 +251,9 @@ def main() -> None:
                 "--tf-stride", str(offm["tf_stride"]),
                 "--overwrite",
             ]
-            run_cmd(collect_cmd, run_dir / "rollout.log", f"iter {it}: rollout + off-manifold threshold")
+            # Live terminal (log_path=None) so the tqdm replan bar shows; the
+            # per-objective t*/off-manifold prints are the persisted diagnostics.
+            run_cmd(collect_cmd, None, f"iter {it}: rollout + off-manifold threshold")
 
             # 2. fresh-oracle supervision on the off-manifold anchors
             build_cmd = [

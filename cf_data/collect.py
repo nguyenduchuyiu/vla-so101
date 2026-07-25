@@ -1,11 +1,12 @@
 """Stage A: collect nominal pick-and-place trajectories with per-frame snapshots.
 
-Each scene (one reset seed) yields 5 nominal episodes, one per objective, all run
-from the same initial state S0. Per control step we store rendered images, the
-proprio row (deg + gripper %), the phase derived from the oracle's current stage,
-and a full physics snapshot (qpos/qvel/ctrl) so build.py can restore the exact state
-for counterfactual rollout. Only successful episodes are kept; a scene is dropped
-entirely if any of its 5 objectives fails, so the 5 objectives stay balanced per scene.
+Each scene (one reset seed) yields NUM_OBJECTIVES x NUM_TARGETS nominal episodes,
+one per (source cube, place target) pair, all run from the same initial state S0.
+Per control step we store rendered images, the proprio row (deg + gripper %), the
+phase derived from the oracle's current stage, and a full physics snapshot
+(qpos/qvel/ctrl) so build.py can restore the exact state for counterfactual
+rollout. Only successful episodes are kept; a scene is dropped entirely if any of
+its (source,target) episodes fails, so the objectives stay balanced per scene.
 """
 
 from __future__ import annotations
@@ -33,16 +34,19 @@ from so101_nexus.observations import (
 )
 
 from cf_data.core import (
+    NUM_OBJECTIVES,
+    NUM_TARGETS,
     OBJECTIVE_COLORS,
-    TARGET_COLOR,
-    objective_instruction,
+    TARGET_COLORS,
+    instruction,
+    variant_for,
     qpos_to_row,
     restore_snapshot,
     save_snapshot,
     stage_to_phase,
 )
 from cf_data.env import CFMultiObjectEnv, ENV_ID
-from vla_data.oracle import Oracle
+from cf_data.oracle import Oracle
 
 CONTROL_DT = 0.02
 
@@ -64,7 +68,7 @@ def _observations(width: int, height: int):
 def make_env(width: int, height: int, source_index: int, robot_init_qpos_noise: float) -> CFMultiObjectEnv:
     config = PickAndPlaceConfig(
         objects=[CubeObject(color=c) for c in OBJECTIVE_COLORS],
-        target_colors=[TARGET_COLOR],
+        target_colors=list(TARGET_COLORS),
         observations=_observations(width, height),
         obs_mode="visual",
         goal_thresh=0.03,
@@ -72,7 +76,7 @@ def make_env(width: int, height: int, source_index: int, robot_init_qpos_noise: 
     return CFMultiObjectEnv(
         config,
         source_index=source_index,
-        target_colors=(TARGET_COLOR,),
+        target_colors=TARGET_COLORS,
         render_mode=None,
         control_mode="pd_joint_pos",
         robot_init_qpos_noise=robot_init_qpos_noise,
@@ -147,51 +151,59 @@ def collect(args: argparse.Namespace) -> Path:
         initial_state_id = f"init_{seed:06d}"
         env.reset(seed=seed)
         s0 = save_snapshot(env)
-        # All 5 objectives share the same stage plan length; probe objective 0 to size max_steps.
-        env.set_objective(0)
+        # All (source,target) objectives share the same stage plan length; probe (0,0) to size max_steps.
+        env.set_objective(0, 0)
         max_steps = sum(s.steps for s in Oracle(ENV_ID, env).stages) + 20
 
         scene_episodes: list[tuple[list[dict], dict]] = []
         scene_failed = False
-        for objective_id in range(len(OBJECTIVE_COLORS)):
-            restore_snapshot(env, s0)
-            env.set_objective(objective_id)
-            oracle = Oracle(ENV_ID, env)
-            try:
-                frames, info, success = _collect_objective(env, oracle, max_steps)
-            except RuntimeError as exc:
-                failures.append({"scene_id": scene_id, "objective_id": objective_id, "error": str(exc)})
-                scene_failed = True
-                break
-            if not success or len(frames) < 8:
-                failures.append(
-                    {
-                        "scene_id": scene_id,
-                        "objective_id": objective_id,
-                        "success": success,
-                        "num_frames": len(frames),
-                    }
+        for source_id in range(NUM_OBJECTIVES):
+            for target_id in range(NUM_TARGETS):
+                restore_snapshot(env, s0)
+                env.set_objective(source_id, target_id)
+                oracle = Oracle(ENV_ID, env)
+                ep_id = f"{scene_id}_s{source_id}_t{target_id}"
+                try:
+                    frames, info, success = _collect_objective(env, oracle, max_steps)
+                except RuntimeError as exc:
+                    failures.append({"scene_id": scene_id, "source_id": source_id, "target_id": target_id, "error": str(exc)})
+                    scene_failed = True
+                    break
+                if not success or len(frames) < 8:
+                    failures.append(
+                        {
+                            "scene_id": scene_id,
+                            "source_id": source_id,
+                            "target_id": target_id,
+                            "success": success,
+                            "num_frames": len(frames),
+                        }
+                    )
+                    scene_failed = True
+                    break
+                scene_episodes.append(
+                    (
+                        frames,
+                        {
+                            "scene_id": scene_id,
+                            "initial_state_id": initial_state_id,
+                            "scene_index": scene_index,
+                            "episode_id": ep_id,
+                            "objective_id": source_id,
+                            "source_id": source_id,
+                            "objective_color": OBJECTIVE_COLORS[source_id],
+                            "target_id": target_id,
+                            "target_color": TARGET_COLORS[target_id],
+                            "instruction": instruction(source_id, target_id, variant_for(ep_id)),
+                            "is_counterfactual": False,
+                            "success": success,
+                            "num_frames": len(frames),
+                            "final_obj_to_target_dist": float(info.get("obj_to_target_dist", float("nan"))),
+                        },
+                    )
                 )
-                scene_failed = True
+            if scene_failed:
                 break
-            scene_episodes.append(
-                (
-                    frames,
-                    {
-                        "scene_id": scene_id,
-                        "initial_state_id": initial_state_id,
-                        "scene_index": scene_index,
-                        "episode_id": f"{scene_id}_obj{objective_id}",
-                        "objective_id": objective_id,
-                        "objective_color": OBJECTIVE_COLORS[objective_id],
-                        "instruction": objective_instruction(objective_id),
-                        "is_counterfactual": False,
-                        "success": success,
-                        "num_frames": len(frames),
-                        "final_obj_to_target_dist": float(info.get("obj_to_target_dist", float("nan"))),
-                    },
-                )
-            )
 
         if scene_failed:
             continue
@@ -200,7 +212,7 @@ def collect(args: argparse.Namespace) -> Path:
             meta.update({"episode_index": episode_index, "file": rel})
             records.append(meta)
             episode_index += 1
-        print(f"scene {scene_index + 1}/{args.scenes} ({scene_id}): saved 5 episodes")
+        print(f"scene {scene_index + 1}/{args.scenes} ({scene_id}): saved {NUM_OBJECTIVES * NUM_TARGETS} episodes")
 
     env.close()
 
@@ -213,9 +225,10 @@ def collect(args: argparse.Namespace) -> Path:
     info = {
         "format": "cf_nominal_v1",
         "dataset_kind": "counterfactual_nominal",
-        "num_objectives": len(OBJECTIVE_COLORS),
+        "num_objectives": NUM_OBJECTIVES,
         "objective_colors": list(OBJECTIVE_COLORS),
-        "target_color": TARGET_COLOR,
+        "num_targets": NUM_TARGETS,
+        "target_colors": list(TARGET_COLORS),
         "num_scenes_requested": args.scenes,
         "num_scenes_saved": len({r["scene_id"] for r in records}),
         "total_episodes": len(records),
@@ -253,7 +266,9 @@ def main() -> None:
     if args.scenes <= 0:
         raise ValueError("--scenes must be positive")
     signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("collect timed out")))
-    signal.alarm(max(60, 150 * args.scenes))
+    # 15 episodes/scene (NUM_OBJECTIVES x NUM_TARGETS) at 256x256 render; the old
+    # 150*scenes constant predates the 3x episode bump and timed out. ~30s/episode.
+    signal.alarm(max(60, 30 * args.scenes * NUM_OBJECTIVES * NUM_TARGETS))
     print(f"dataset ready: {collect(args)}")
 
 

@@ -35,24 +35,29 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from tqdm import tqdm
 from so101_nexus.lerobot_dataset import dataset_row_to_sim_qpos, sim_qpos_to_dataset_row
 
 from cf_data.collect import make_env
 from cf_data.core import (
+    NUM_OBJECTIVES,
+    NUM_TARGETS,
     OBJECTIVE_COLORS,
     REACH_PICK,
     Snapshot,
+    TARGET_COLORS,
     get_gripper_limits,
-    objective_instruction,
+    instruction,
     qpos_to_row,
     restore_snapshot,
     save_snapshot,
     stage_to_phase,
+    variant_for,
 )
 from cf_data.env import ENV_ID
 from models.utils import load_vla_for_inference, pick_device
 from simvla_datasets.utils import build_image_transform
-from vla_data.oracle import Oracle
+from cf_data.oracle import Oracle
 
 CONTROL_DT = 0.02
 
@@ -114,7 +119,8 @@ def _teacher_forcing(env, model, processor, transform, device, limits, instructi
 
 
 def _closed_loop(env, model, processor, transform, device, limits, instruction,
-                 execute_steps: int, max_replans: int, policy_seed: int) -> tuple[list[dict], dict]:
+                 execute_steps: int, max_replans: int, policy_seed: int,
+                 desc: str = "closed-loop") -> tuple[list[dict], dict]:
     """Model closed-loop from the current state; record every control step."""
     obs = env._get_obs()
     frames: list[dict] = []
@@ -122,13 +128,19 @@ def _closed_loop(env, model, processor, transform, device, limits, instruction,
     done = False
     torch.manual_seed(policy_seed)
     u = env.unwrapped
-    for _ in range(max_replans):
-        try:
-            oracle = Oracle(ENV_ID, env)
-            stage_name = oracle.stages[0].name if oracle.stages else "finished"
-            phase = stage_to_phase(stage_name)
-        except RuntimeError:
-            phase, stage_name = REACH_PICK, "unreachable"
+    # Label phase/stage ONCE from the initial state (the model diverges early, so
+    # off-manifold frames are near the start anyway). Re-planning the Oracle every
+    # replan just for a label is the dominant non-VLM cost and crashes IK on
+    # off-manifold poses. build.py --dagger does not balance per-phase, so a single
+    # phase is fine.
+    try:
+        oracle = Oracle(ENV_ID, env)
+        stage_name = oracle.stages[0].name if oracle.stages else "finished"
+        phase = stage_to_phase(stage_name)
+    except (RuntimeError, ValueError):
+        phase, stage_name = REACH_PICK, "unreachable"
+    pbar = tqdm(range(max_replans), desc=desc, leave=False)
+    for _ in pbar:
         images, image_mask = preprocess(obs, transform)
         state = sim_qpos_to_dataset_row(np.asarray(obs["state"], dtype=np.float64), gripper_limits_rad=limits)
         lang = processor.encode_language([instruction])
@@ -166,6 +178,7 @@ def _closed_loop(env, model, processor, transform, device, limits, instruction,
                 break
         if done:
             break
+    pbar.close()
     return frames, info
 
 
@@ -227,88 +240,93 @@ def collect(args: argparse.Namespace) -> Path:
         scene_id = f"scene_{seed:06d}"
         env.reset(seed=seed)
         s0 = save_snapshot(env)
-        for objective_id in range(len(OBJECTIVE_COLORS)):
-            ep_id = f"{scene_id}_obj{objective_id}"
-            instruction = objective_instruction(objective_id)
+        for source_id in range(NUM_OBJECTIVES):
+            for target_id in range(NUM_TARGETS):
+                ep_id = f"{scene_id}_s{source_id}_t{target_id}"
+                instr = instruction(source_id, target_id, variant_for(ep_id))
 
-            # 1. GT oracle trajectory from S0
-            restore_snapshot(env, s0)
-            env.set_objective(objective_id)
-            try:
-                gt_states, gt_snaps = _oracle_gt(env, max_steps)
-            except RuntimeError as exc:
-                print(f"  {ep_id}: oracle GT failed ({exc}), skipping")
-                continue
-            if len(gt_states) < 8:
-                print(f"  {ep_id}: GT too short ({len(gt_states)}), skipping")
-                continue
+                # 1. GT oracle trajectory from S0
+                restore_snapshot(env, s0)
+                env.set_objective(source_id, target_id)
+                try:
+                    gt_states, gt_snaps = _oracle_gt(env, max_steps)
+                except RuntimeError as exc:
+                    print(f"  {ep_id}: oracle GT failed ({exc}), skipping")
+                    continue
+                if len(gt_states) < 8:
+                    print(f"  {ep_id}: GT too short ({len(gt_states)}), skipping")
+                    continue
 
-            # 2. teacher-forcing (on-manifold model error)
-            tf_frames, tf_maes = _teacher_forcing(
-                env, model, processor, transform, device, limits, instruction,
-                gt_states, gt_snaps, args.tf_stride,
-            )
+                # 2. teacher-forcing (on-manifold model error)
+                tf_frames, tf_maes = _teacher_forcing(
+                    env, model, processor, transform, device, limits, instr,
+                    gt_states, gt_snaps, args.tf_stride,
+                )
 
-            # 3. closed-loop (model rollout)
-            restore_snapshot(env, s0)
-            env.set_objective(objective_id)
-            cl_frames, info = _closed_loop(
-                env, model, processor, transform, device, limits, instruction,
-                args.execute_steps, args.max_replans,
-                args.policy_seed + scene_index * 100 + objective_id,
-            )
-            if not cl_frames:
-                print(f"  {ep_id}: closed-loop produced 0 frames, skipping")
-                continue
+                # 3. closed-loop (model rollout)
+                restore_snapshot(env, s0)
+                env.set_objective(source_id, target_id)
+                cl_frames, info = _closed_loop(
+                    env, model, processor, transform, device, limits, instr,
+                    args.execute_steps, args.max_replans,
+                    args.policy_seed + scene_index * 100 + source_id * 10 + target_id,
+                    desc=f"{ep_id} rollout",
+                )
+                if not cl_frames:
+                    print(f"  {ep_id}: closed-loop produced 0 frames, skipping")
+                    continue
 
-            # 4. trackMAE + off-manifold threshold t*
-            n = min(len(cl_frames), len(gt_states))
-            cl_proprio = np.stack([f["proprio"] for f in cl_frames])[:n]
-            gt_proprio = np.stack(gt_states)[:n]
-            track_mae = np.abs(cl_proprio[:, :5] - gt_proprio[:, :5]).mean(axis=1)
-            t_star = _find_threshold(track_mae, args.track_mae_threshold, args.persist_steps)
-            # model outlasted the expert -> those states are off-manifold by definition
-            if t_star is None and len(cl_frames) > len(gt_states):
-                t_star = len(gt_states)
+                # 4. trackMAE + off-manifold threshold t*
+                n = min(len(cl_frames), len(gt_states))
+                cl_proprio = np.stack([f["proprio"] for f in cl_frames])[:n]
+                gt_proprio = np.stack(gt_states)[:n]
+                track_mae = np.abs(cl_proprio[:, :5] - gt_proprio[:, :5]).mean(axis=1)
+                t_star = _find_threshold(track_mae, args.track_mae_threshold, args.persist_steps)
+                # model outlasted the expert -> those states are off-manifold by definition
+                if t_star is None and len(cl_frames) > len(gt_states):
+                    t_star = len(gt_states)
 
-            if t_star is None:
-                print(f"  {ep_id}: on-manifold throughout (max trackMAE={track_mae.max():.2f}), no DAgger data")
-                probes.append(_probe_record(ep_id, objective_id, None, cl_frames, track_mae, tf_frames, tf_maes, info))
-                continue
-            off = cl_frames[t_star:]
-            if len(off) < args.min_offmanifold_frames:
-                print(f"  {ep_id}: t*={t_star} but only {len(off)} off-manifold frames, skipping")
-                probes.append(_probe_record(ep_id, objective_id, t_star, cl_frames, track_mae, tf_frames, tf_maes, info))
-                continue
+                if t_star is None:
+                    print(f"  {ep_id}: on-manifold throughout (max trackMAE={track_mae.max():.2f}), no DAgger data")
+                    probes.append(_probe_record(ep_id, source_id, target_id, None, cl_frames, track_mae, tf_frames, tf_maes, info))
+                    continue
+                off = cl_frames[t_star:]
+                if len(off) < args.min_offmanifold_frames:
+                    print(f"  {ep_id}: t*={t_star} but only {len(off)} off-manifold frames, skipping")
+                    probes.append(_probe_record(ep_id, source_id, target_id, t_star, cl_frames, track_mae, tf_frames, tf_maes, info))
+                    continue
 
-            rel = _save_episode(out, episode_index, off)
-            records.append(
-                {
-                    "scene_id": scene_id,
-                    "scene_index": scene_index,
-                    "initial_state_id": f"init_{seed:06d}",
-                    "episode_id": ep_id,
-                    "objective_id": objective_id,
-                    "objective_color": OBJECTIVE_COLORS[objective_id],
-                    "instruction": instruction,
-                    "is_counterfactual": False,
-                    "dagger": True,
-                    "t_star": int(t_star),
-                    "num_offmanifold_frames": len(off),
-                    "success": bool(info.get("success", False)),
-                    "is_grasped": bool(info.get("is_grasped", False)),
-                    "num_frames": len(off),
-                    "final_obj_to_target_dist": float(info.get("obj_to_target_dist", float("nan"))),
-                    "episode_index": episode_index,
-                    "file": rel,
-                }
-            )
-            episode_index += 1
-            probes.append(_probe_record(ep_id, objective_id, t_star, cl_frames, track_mae, tf_frames, tf_maes, info))
-            print(
-                f"  {ep_id}: t*={t_star} off-manifold={len(off)} frames "
-                f"(on-manifold chunkMAE={np.mean(tf_maes):.2f}deg, trackMAE@t*={track_mae[t_star] if t_star < n else float('nan'):.2f}deg)"
-            )
+                rel = _save_episode(out, episode_index, off)
+                records.append(
+                    {
+                        "scene_id": scene_id,
+                        "scene_index": scene_index,
+                        "initial_state_id": f"init_{seed:06d}",
+                        "episode_id": ep_id,
+                        "objective_id": source_id,
+                        "source_id": source_id,
+                        "objective_color": OBJECTIVE_COLORS[source_id],
+                        "target_id": target_id,
+                        "target_color": TARGET_COLORS[target_id],
+                        "instruction": instr,
+                        "is_counterfactual": False,
+                        "dagger": True,
+                        "t_star": int(t_star),
+                        "num_offmanifold_frames": len(off),
+                        "success": bool(info.get("success", False)),
+                        "is_grasped": bool(info.get("is_grasped", False)),
+                        "num_frames": len(off),
+                        "final_obj_to_target_dist": float(info.get("obj_to_target_dist", float("nan"))),
+                        "episode_index": episode_index,
+                        "file": rel,
+                    }
+                )
+                episode_index += 1
+                probes.append(_probe_record(ep_id, source_id, target_id, t_star, cl_frames, track_mae, tf_frames, tf_maes, info))
+                print(
+                    f"  {ep_id}: t*={t_star} off-manifold={len(off)} frames "
+                    f"(on-manifold chunkMAE={np.mean(tf_maes):.2f}deg, trackMAE@t*={track_mae[t_star] if t_star < n else float('nan'):.2f}deg)"
+                )
     env.close()
 
     with (out / "meta" / "nominal_episodes.jsonl").open("w", encoding="utf-8") as h:
@@ -322,8 +340,10 @@ def collect(args: argparse.Namespace) -> Path:
         "dataset_kind": "dagger_offmanifold",
         "num_objectives": len(OBJECTIVE_COLORS),
         "objective_colors": list(OBJECTIVE_COLORS),
-        "target_color": "white",
+        "num_targets": NUM_TARGETS,
+        "target_colors": list(TARGET_COLORS),
         "num_scenes_requested": args.scenes,
+        "num_scenes_saved": len({r["scene_id"] for r in records}),
         "total_episodes": len(records),
         "total_offmanifold_frames": sum(r["num_offmanifold_frames"] for r in records),
         "image_shape": [args.height, args.width, 3],
@@ -337,10 +357,12 @@ def collect(args: argparse.Namespace) -> Path:
     return out
 
 
-def _probe_record(ep_id, objective_id, t_star, cl_frames, track_mae, tf_frames, tf_maes, info) -> dict:
+def _probe_record(ep_id, source_id, target_id, t_star, cl_frames, track_mae, tf_frames, tf_maes, info) -> dict:
     return {
         "episode_id": ep_id,
-        "objective_id": objective_id,
+        "objective_id": source_id,
+        "source_id": source_id,
+        "target_id": target_id,
         "t_star": None if t_star is None else int(t_star),
         "num_closed_loop_frames": len(cl_frames),
         "on_manifold_chunkMAE_mean": float(np.mean(tf_maes)) if tf_maes else float("nan"),
@@ -376,7 +398,11 @@ def main() -> None:
     if args.scenes <= 0:
         raise ValueError("--scenes must be positive")
     signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("dagger collect timed out")))
-    signal.alarm(max(60, 300 * args.scenes))
+    # Each objective runs GT + teacher-forcing + closed-loop (max_replans model
+    # calls). Closed-loop dominates: ~1.5s/replan on MPS (VLM generate + 2 sim
+    # substeps). Scale the alarm to the real work, not a flat per-scene guess.
+    budget = args.max_replans * NUM_OBJECTIVES * NUM_TARGETS * args.scenes
+    signal.alarm(max(60, int(budget * 1.5) + 60))
     print(f"dataset ready: {collect(args)}")
 
 

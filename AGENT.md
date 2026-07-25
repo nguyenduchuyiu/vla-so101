@@ -38,6 +38,10 @@ Do not write production-style abstractions unless explicitly requested.
 * Fail fast when required files, inputs, topics, models, or configs are missing.
 * Keep error messages short and actionable.
 
+## Test rule
+* Put test scripts and their outputs, logs, ... in one folder, do not put them everywhere, keep this workspace tidy.
+* Write short report what was tested, what insight 
+
 ## Research prototype standard
 
 The code should be good enough to run experiments, debug results, and modify quickly.

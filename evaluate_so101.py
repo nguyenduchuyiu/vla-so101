@@ -17,7 +17,13 @@ from so101_nexus.lerobot_dataset import (
 from models.utils import load_vla_for_inference, pick_device
 from simvla_datasets.utils import build_image_transform
 from cf_data.collect import make_env
-from cf_data.core import OBJECTIVE_COLORS, get_gripper_limits, objective_instruction
+from cf_data.core import (
+    NUM_TARGETS,
+    OBJECTIVE_COLORS,
+    TARGET_COLORS,
+    get_gripper_limits,
+    instruction,
+)
 
 
 def preprocess_images(
@@ -41,7 +47,14 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--policy_seed", type=int)
-    parser.add_argument("--objective_id", type=int, choices=range(5), default=0, help="0: red, 1: blue, 2: green, 3: yellow, 4: purple")
+    parser.add_argument(
+        "--objective_id", type=int, choices=range(len(OBJECTIVE_COLORS)), default=0,
+        help="0: red, 1: blue, 2: green, 3: yellow, 4: purple",
+    )
+    parser.add_argument(
+        "--target_id", type=int, choices=range(NUM_TARGETS), default=0,
+        help="place target: 0: white, 1: black, 2: orange",
+    )
     parser.add_argument("--instruction", type=str)
     parser.add_argument("--execute_steps", type=int, default=5)
     parser.add_argument("--max_replans", type=int, default=400)
@@ -68,8 +81,8 @@ def main() -> None:
     frames: list[np.ndarray] = []
     try:
         obs, info = env.reset(seed=args.seed)
-        env.set_objective(args.objective_id)
-        instruction = args.instruction or objective_instruction(args.objective_id)
+        env.set_objective(args.objective_id, args.target_id)
+        instruction = args.instruction or instruction(args.objective_id, args.target_id, 0)
         limits = get_gripper_limits(env)
         torch.manual_seed(args.seed if args.policy_seed is None else args.policy_seed)
 

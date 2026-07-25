@@ -14,7 +14,12 @@ outputs/
 SimVLA/runs/
 runs/
 logs/
+data/
 checkpoints/
+norm_stats
+
+# Scratch: probe scripts + probe logs (moved out of the way, not pushed)
+probe/
 *.ckpt
 *.pth
 *.pt

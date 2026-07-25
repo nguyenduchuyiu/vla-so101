@@ -1,0 +1,10 @@
+
+======================================================================
+[dagger] iteration 0/1  ->  runs/dagger/iter00
+======================================================================
+
+[dagger] iter 0: expert rollout (collect.py)
+[dagger] $ /Users/nguyenduchuyiu/projects/vla-so101/.venv/bin/python -m cf_data.collect --out data/dagger/bootstrap --scenes 1 --seed 0 --width 256 --height 256 --robot-noise 0.0 --overwrite
+
+[dagger] iter 0: build CF anchors (build.py normal)
+[dagger] $ /Users/nguyenduchuyiu/projects/vla-so101/.venv/bin/python -m cf_data.build --in data/dagger/bootstrap --horizon 32 --anchor-stride 4 --seed 0 --overwrite --max-anchors 250

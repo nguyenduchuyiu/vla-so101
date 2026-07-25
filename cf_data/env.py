@@ -1,12 +1,12 @@
-"""Counterfactual pick-and-place env: N cubes (one per objective) + 1 shared target.
+"""Counterfactual pick-and-place env: N source cubes + K place targets.
 
-Same scene layout (object poses, robot pose, cameras) is produced for every
-objective from a single scene seed, because ``_task_reset`` places objects at
-fixed anchors jittered only by ``self.np_random`` (seeded once per reset). The
-collector captures the post-reset state once and restores it before running the
-oracle toward each objective, so all N nominal trajectories share the same
-starting state. ``source_index`` selects which cube the oracle picks; the
-target is shared (``target_index`` is always 0).
+Same scene layout (object poses, target poses, robot pose, cameras) is produced
+for every (source, target) objective from a single scene seed, because
+``_task_reset`` places objects and targets at fixed anchors jittered only by
+``self.np_random`` (seeded once per reset). The collector captures the post-reset
+state once and restores it before running the oracle toward each objective, so
+all nominal trajectories share the same starting state. ``source_index`` selects
+which cube the oracle picks; ``target_index`` selects which target it places on.
 """
 
 from __future__ import annotations
@@ -29,10 +29,11 @@ _SO101_DIR = get_so101_mujoco_model_dir()
 _SO101_XML = get_so101_mujoco_model_path()
 _TARGET_Z = 0.001
 _PLACE_Z_SLACK = 0.01
-# Objects spread laterally at a reachable depth; target centered behind them.
+# Objects spread laterally at a reachable depth; targets centered behind them.
 _SOURCE_X = 0.28
 _SOURCE_Y_RANGE = 0.16
-_TARGET_XY = (0.40, 0.0)
+_TARGET_X = 0.40
+_TARGET_Y_RANGE = 0.12
 _JITTER = 0.012
 
 
@@ -48,18 +49,36 @@ def _source_anchors(num_objects: int) -> list[tuple[float, float]]:
     ]
 
 
-def _target_body_xml(color: str, radius: float) -> str:
-    r, g, b, a = COLOR_MAP[color]
-    return (
-        '    <body name="cf_target_0" pos="0.4 0 0.001">\n'
-        f'      <geom name="cf_target_geom_0" type="cylinder" '
-        f'size="{radius} 0.001" rgba="{r} {g} {b} {a}" contype="0" conaffinity="0"/>\n'
-        "    </body>\n"
-    )
+def _target_anchors(num_targets: int) -> list[tuple[float, float]]:
+    # Evenly spaced across y at fixed target x (behind the source row). Targets are
+    # visual-only (contype=0) and disjoint in color from sources.
+    if num_targets < 1:
+        raise ValueError("need at least 1 target")
+    if num_targets == 1:
+        return [(_TARGET_X, 0.0)]
+    span = 2 * _TARGET_Y_RANGE
+    return [
+        (_TARGET_X, -_TARGET_Y_RANGE + i * span / (num_targets - 1))
+        for i in range(num_targets)
+    ]
+
+
+def _target_body_xml(colors: tuple[str, ...], radius: float) -> str:
+    anchors = _target_anchors(len(colors))
+    bodies = []
+    for i, (color, (x, y)) in enumerate(zip(colors, anchors, strict=True)):
+        r, g, b, a = COLOR_MAP[color]
+        bodies.append(
+            f'    <body name="cf_target_{i}" pos="{x} {y} {_TARGET_Z}">\n'
+            f'      <geom name="cf_target_geom_{i}" type="cylinder" '
+            f'size="{radius} 0.001" rgba="{r} {g} {b} {a}" contype="0" conaffinity="0"/>\n'
+            "    </body>\n"
+        )
+    return "".join(bodies)
 
 
 class CFMultiObjectEnv(SO101NexusMuJoCoBaseEnv):
-    """N visible cubes and one visible shared target; task = pick source cube, place on target."""
+    """N visible source cubes and K visible targets; task = pick source cube, place on chosen target."""
 
     config: PickAndPlaceConfig
     default_config_cls: ClassVar[type[PickAndPlaceConfig]] = PickAndPlaceConfig
@@ -69,18 +88,21 @@ class CFMultiObjectEnv(SO101NexusMuJoCoBaseEnv):
         config: PickAndPlaceConfig,
         *,
         source_index: int,
+        target_index: int = 0,
         target_colors: tuple[str, ...],
         render_mode: str | None = None,
         control_mode: ControlMode = "pd_joint_pos",
         robot_init_qpos_noise: float = 0.02,
     ) -> None:
-        if len(target_colors) != 1:
-            raise ValueError("CFMultiObjectEnv uses a single shared target; pass one target color")
+        if len(target_colors) < 1:
+            raise ValueError("CFMultiObjectEnv needs at least one target color")
         objects = config.object_pool()
         if len(objects) < 2:
             raise ValueError("CFMultiObjectEnv requires at least 2 source objects")
         if not 0 <= source_index < len(objects):
             raise IndexError(source_index)
+        if not 0 <= target_index < len(target_colors):
+            raise IndexError(target_index)
         self._init_common(
             config=config,
             render_mode=render_mode,
@@ -88,7 +110,7 @@ class CFMultiObjectEnv(SO101NexusMuJoCoBaseEnv):
             robot_init_qpos_noise=robot_init_qpos_noise,
         )
         self.source_index = source_index
-        self.target_index = 0  # shared target is always index 0
+        self.target_index = target_index
         self.target_colors = tuple(target_colors)
         slot_names = [f"cf_source_{i}" for i in range(len(objects))]
         xml = build_object_scene_xml(
@@ -98,7 +120,7 @@ class CFMultiObjectEnv(SO101NexusMuJoCoBaseEnv):
             option_xml=MUJOCO_SCENE_OPTION_XML,
             robot_xml_path=str(_SO101_XML),
             model_name="cf_multi_object_pick_place",
-            extra_bodies=_target_body_xml(self.target_colors[0], config.target_disc_radius),
+            extra_bodies=_target_body_xml(self.target_colors, config.target_disc_radius),
         )
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".xml", dir=_SO101_DIR, delete=True
@@ -109,24 +131,37 @@ class CFMultiObjectEnv(SO101NexusMuJoCoBaseEnv):
         self.data = mujoco.MjData(self.model)
         self._slots = extract_object_slots(self.model, slot_names, objects)
         self._target_body_ids = [
-            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "cf_target_0")
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"cf_target_{i}")
+            for i in range(len(self.target_colors))
         ]
         self._source_anchors = _source_anchors(len(objects))
+        self._target_anchors = _target_anchors(len(self.target_colors))
         self._obj_geom_id = self._slots[source_index].geom_id
         self._initial_obj_z = self._slots[source_index].spawn_z
         self._finish_model_setup()
 
-    def set_objective(self, source_index: int) -> None:
-        """Switch which cube the oracle picks (used for nominal + counterfactual replay)."""
+    def set_objective(self, source_index: int, target_index: int) -> None:
+        """Switch which cube the oracle picks and which target it places on.
+
+        Must be called before constructing the Oracle, which reads the target
+        position via ``_get_target_pos`` (indexed by ``target_index``) at planning
+        time.
+        """
         if not 0 <= source_index < len(self._slots):
             raise IndexError(source_index)
+        if not 0 <= target_index < len(self.target_colors):
+            raise IndexError(target_index)
         self.source_index = source_index
+        self.target_index = target_index
         self._obj_geom_id = self._slots[source_index].geom_id
         self._initial_obj_z = self._slots[source_index].spawn_z
 
     @property
     def task_description(self) -> str:
-        return f"Pick up the {self._slots[self.source_index].obj!r} and place it on the {self.target_colors[0]} target."
+        return (
+            f"Pick up the {self._slots[self.source_index].obj!r} and place it on "
+            f"the {self.target_colors[self.target_index]} target."
+        )
 
     def _get_object_pose(self) -> np.ndarray:
         addr = self._slots[self.source_index].qpos_addr
@@ -156,11 +191,12 @@ class CFMultiObjectEnv(SO101NexusMuJoCoBaseEnv):
                 anchor[1] + float(rng.uniform(-_JITTER, _JITTER)),
             )
             place_freejoint_slot(self.model, self.data, slot, rng, xy)
-        self.model.body_pos[self._target_body_ids[0]] = [
-            _TARGET_XY[0] + float(rng.uniform(-_JITTER, _JITTER)),
-            _TARGET_XY[1] + float(rng.uniform(-_JITTER, _JITTER)),
-            _TARGET_Z,
-        ]
+        for body_id, anchor in zip(self._target_body_ids, self._target_anchors, strict=True):
+            self.model.body_pos[body_id] = [
+                anchor[0] + float(rng.uniform(-_JITTER, _JITTER)),
+                anchor[1] + float(rng.uniform(-_JITTER, _JITTER)),
+                _TARGET_Z,
+            ]
         self._obj_geom_id = self._slots[self.source_index].geom_id
         self._initial_obj_z = self._slots[self.source_index].spawn_z
 
