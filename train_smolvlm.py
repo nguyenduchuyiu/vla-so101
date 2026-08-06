@@ -49,14 +49,41 @@ def save_optimizer_state(accelerator, optimizer, checkpoint_dir: str) -> None:
     )
 
 
-def load_optimizer_state(optimizer, checkpoint_dir: str) -> bool:
-    """Restore optimizer state; return False for legacy weight-only checkpoints."""
+def load_optimizer_state(
+    optimizer, checkpoint_dir: str
+) -> tuple[bool, str | None]:
+    """Restore optimizer state, reporting absent or incompatible checkpoints."""
     path = os.path.join(checkpoint_dir, OPTIMIZER_STATE_FILENAME)
     if not os.path.isfile(path):
-        return False
+        return False, "checkpoint has no optimizer state"
     state = torch.load(path, map_location="cpu", weights_only=True)
-    optimizer.load_state_dict(state)
-    return True
+    try:
+        optimizer.load_state_dict(state)
+    except ValueError as exc:
+        # Parameter groups legitimately change when repairing a legacy LoRA
+        # checkpoint that accidentally trained the full VLM. Model weights are
+        # still valid; Adam moments cannot be mapped safely by parameter name.
+        return False, f"optimizer state is incompatible: {exc}"
+    return True, None
+
+
+def mark_only_lora_trainable(module: torch.nn.Module) -> tuple[int, int]:
+    """Restore LoRA requires_grad flags, which are not stored in checkpoints."""
+    trainable = 0
+    total = 0
+    trainable_tensors = 0
+    for name, parameter in module.named_parameters():
+        is_adapter = "lora_" in name
+        parameter.requires_grad_(is_adapter)
+        total += parameter.numel()
+        if is_adapter:
+            trainable += parameter.numel()
+            trainable_tensors += 1
+    if trainable_tensors == 0:
+        raise RuntimeError(
+            "lora_rank > 0 but no lora_* parameters were found in the VLM"
+        )
+    return trainable, total
 
 
 # ============================================================
@@ -427,8 +454,7 @@ def main(args):
         model.vlm.requires_grad_(False)
         logger.info("SmolVLM backbone is frozen (no gradients or optimizer state)")
     elif args.lora_rank > 0:
-        trainable_vlm = sum(p.numel() for p in model.vlm.parameters() if p.requires_grad)
-        total_vlm = sum(p.numel() for p in model.vlm.parameters())
+        trainable_vlm, total_vlm = mark_only_lora_trainable(model.vlm)
         logger.info(
             f"SmolVLM LoRA trainable parameters: {trainable_vlm:,}/{total_vlm:,} "
             f"({100 * trainable_vlm / total_vlm:.3f}%)"
@@ -488,13 +514,16 @@ def main(args):
         )
     optimizer_restored = False
     if args.resume and load_path and os.path.isdir(load_path):
-        optimizer_restored = load_optimizer_state(optim, load_path)
+        optimizer_restored, optimizer_restore_error = load_optimizer_state(
+            optim, load_path
+        )
         if optimizer_restored:
             logger.info(f"Restored optimizer state from: {load_path}")
         else:
             logger.warning(
-                f"Resume checkpoint has no {OPTIMIZER_STATE_FILENAME}; "
-                "weights/global_step will resume but Adam moments start fresh"
+                f"Could not restore {OPTIMIZER_STATE_FILENAME}: "
+                f"{optimizer_restore_error}. Weights will resume, but Adam "
+                "moments start fresh."
             )
     model, optim = accelerator.prepare(model, optim)
 
@@ -510,7 +539,11 @@ def main(args):
     # or pin the cosine LR at min_lr with no warmup.
     global_step, t0 = 0, time.time()
     if args.resume and load_path and os.path.isdir(load_path):
-        logger.info(f"Resumed weights/optimizer from {load_path}; LR schedule restarted at step 0 for {args.iters} steps")
+        restored_parts = "weights + optimizer" if optimizer_restored else "weights only"
+        logger.info(
+            f"Resumed {restored_parts} from {load_path}; LR schedule restarted "
+            f"at step 0 for {args.iters} steps"
+        )
     logger.info(f"🚀 Start SmolVLM-VLA training for {args.iters} steps")
     logger.info(
         f"   world_size={accelerator.num_processes} "
