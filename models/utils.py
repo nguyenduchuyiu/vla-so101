@@ -11,9 +11,23 @@ from .processing_smolvlm_vla import SmolVLMVLAProcessor
 
 
 def pick_device() -> torch.device:
-    """cuda if available, else mps, else cpu."""
+    """Pick the CUDA device with most free VRAM, else MPS, else CPU.
+
+    CUDA indices are the logical devices exposed by CUDA_VISIBLE_DEVICES, so an
+    explicit visibility setting is always respected.
+    """
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        try:
+            free_by_device = [
+                torch.cuda.mem_get_info(index)[0]
+                for index in range(torch.cuda.device_count())
+            ]
+            index = max(
+                range(len(free_by_device)), key=free_by_device.__getitem__
+            )
+            return torch.device("cuda", index)
+        except (RuntimeError, IndexError):
+            return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")

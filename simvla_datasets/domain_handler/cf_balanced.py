@@ -57,6 +57,28 @@ class CFBalancedHandler(DomainHandler):
         # an anchor share it so the flow head samples one t/noise per group.
         for ai, anchor in enumerate(self.anchors):
             anchor["_group_id"] = ai
+        shard_id = int(meta.get("_shard_id", 0))
+        num_shards = int(meta.get("_num_shards", 1))
+        if not 0 <= shard_id < num_shards:
+            raise ValueError(f"invalid cf_balanced shard {shard_id}/{num_shards}")
+        # Keep every branch of an anchor on one rank. Greedy assignment by
+        # branch count balances uneven anchors while preserving flow groups.
+        if num_shards > 1:
+            if len(self.anchors) < num_shards:
+                raise ValueError(
+                    f"cf_balanced has {len(self.anchors)} anchors but needs at "
+                    f"least {num_shards} for disjoint distributed shards"
+                )
+            loads = [0] * num_shards
+            partitions: list[list[dict]] = [[] for _ in range(num_shards)]
+            for anchor in sorted(
+                self.anchors,
+                key=lambda item: (-len(item["branches"]), int(item["_group_id"])),
+            ):
+                target = min(range(num_shards), key=lambda rank: (loads[rank], rank))
+                partitions[target].append(anchor)
+                loads[target] += len(anchor["branches"])
+            self.anchors = partitions[shard_id]
         self.cache: dict[str, dict[str, np.ndarray]] = {}
 
     def _npz(self, rel: str) -> dict[str, np.ndarray]:

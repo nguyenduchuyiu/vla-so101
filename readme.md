@@ -8,6 +8,11 @@ python run_dagger.py dagger_config.yaml
 
 Runs the full DAgger loop (expert rollout → train → closed-loop rollout → off-manifold collect → re-supervise → merge → train) for `run.iterations` iterations. Edit `dagger_config.yaml` to change settings; do not pass CLI flags.
 
+`launch.num_processes: auto` enables DDP over every free GPU; an integer caps the
+world size. The pipeline selects devices by VRAM use and utilization, unless `CUDA_VISIBLE_DEVICES` or
+`launch.gpu_ids` pins them explicitly. Counterfactual anchors are sharded across
+ranks without splitting an anchor's branches.
+
 Checkpoints land in `runs/dagger/iterNN/`, norm stats in `norm_stats/iterNN_norm.json`.
 
 ## Test (eval a checkpoint, writes an mp4)

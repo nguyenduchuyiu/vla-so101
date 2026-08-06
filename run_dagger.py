@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -35,16 +36,21 @@ from pathlib import Path
 import yaml
 
 
-def run_cmd(cmd: list[str], log_path: Path | None, label: str) -> None:
+def run_cmd(
+    cmd: list[str],
+    log_path: Path | None,
+    label: str,
+    env: dict[str, str] | None = None,
+) -> None:
     """Run a subprocess; if log_path is None inherit the terminal (live tqdm). Fail fast."""
     print(f"\n[dagger] {label}")
     print(f"[dagger] $ {' '.join(map(str, cmd))}")
     if log_path is None:
-        proc = subprocess.run(cmd)
+        proc = subprocess.run(cmd, env=env)
     else:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "w") as f:
-            proc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+            proc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
     if proc.returncode != 0:
         raise RuntimeError(f"{label} failed (rc={proc.returncode}); see {log_path or 'terminal'}")
 
@@ -54,6 +60,122 @@ def latest_ckpt(run_dir: Path) -> Path:
     if not ckpts:
         raise RuntimeError(f"no checkpoint found in {run_dir}")
     return ckpts[-1]
+
+
+def training_environment(launch: dict) -> dict[str, str]:
+    """Restrict child processes to the requested, freest NVIDIA GPUs.
+
+    An existing CUDA_VISIBLE_DEVICES always wins. Otherwise ``gpu_ids`` can pin
+    an explicit list; with ``auto_select_gpus`` (the default), nvidia-smi is
+    queried and devices are ranked by free memory, then lower utilization.
+    """
+    env = os.environ.copy()
+    requested = launch.get("num_processes", "auto")
+    auto_count = isinstance(requested, str) and requested.lower() == "auto"
+    if not auto_count:
+        count = int(requested)
+        if count < 1:
+            raise ValueError("launch.num_processes must be positive or 'auto'")
+    visible_is_set = "CUDA_VISIBLE_DEVICES" in env
+    visible = env.get("CUDA_VISIBLE_DEVICES", "")
+    explicit = launch.get("gpu_ids")
+
+    if visible_is_set:
+        chosen = [value.strip() for value in visible.split(",") if value.strip()]
+        if not chosen:
+            count = 1 if auto_count else count
+            if count > 1:
+                raise ValueError(
+                    "CUDA_VISIBLE_DEVICES disables CUDA, but "
+                    f"launch.num_processes={count}"
+                )
+            print("[dagger] CUDA disabled by CUDA_VISIBLE_DEVICES")
+            launch["_resolved_num_processes"] = count
+            return env
+        count = len(chosen) if auto_count else count
+        if len(chosen) < count:
+            raise ValueError(
+                f"CUDA_VISIBLE_DEVICES exposes {len(chosen)} GPU(s), but "
+                f"launch.num_processes={count}"
+            )
+        print(f"[dagger] respecting CUDA_VISIBLE_DEVICES={visible}")
+        launch["_resolved_num_processes"] = count
+        return env
+
+    if explicit is not None:
+        chosen = [str(value) for value in explicit]
+        count = len(chosen) if auto_count else count
+        if not chosen:
+            raise ValueError("launch.gpu_ids cannot be empty")
+        if len(chosen) != count:
+            raise ValueError(
+                f"launch.gpu_ids must contain exactly {count} entries, got {chosen}"
+            )
+        print(f"[dagger] using configured GPU IDs: {','.join(chosen)}")
+    elif launch.get("auto_select_gpus", True):
+        query = [
+            "nvidia-smi",
+            "--query-gpu=index,memory.free,memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            result = subprocess.run(query, check=True, capture_output=True, text=True)
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            if auto_count or count == 1:
+                count = 1
+                print(
+                    "[dagger] nvidia-smi unavailable; leaving device selection "
+                    "to PyTorch (CPU/MPS/CUDA default)"
+                )
+                launch["_resolved_num_processes"] = count
+                return env
+            raise RuntimeError(
+                "multi-GPU automatic selection requires a working nvidia-smi; "
+                "set launch.gpu_ids or export CUDA_VISIBLE_DEVICES"
+            ) from exc
+        devices = []
+        for line in result.stdout.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 4:
+                continue
+            index, free_mb, used_mb, utilization = map(int, fields)
+            devices.append((index, free_mb, used_mb, utilization))
+        max_used = int(launch.get("max_gpu_memory_used_mb", 1024))
+        max_util = int(launch.get("max_gpu_utilization", 20))
+        eligible = [
+            device
+            for device in devices
+            if device[2] <= max_used and device[3] <= max_util
+        ]
+        count = len(eligible) if auto_count else count
+        if count < 1:
+            raise RuntimeError(
+                "no free GPU matched launch.max_gpu_memory_used_mb="
+                f"{max_used} and launch.max_gpu_utilization={max_util}"
+            )
+        if len(eligible) < count:
+            raise RuntimeError(
+                f"requested {count} GPU process(es), but only {len(eligible)} "
+                f"matched the free-GPU thresholds (nvidia-smi reported "
+                f"{len(devices)} total)"
+            )
+        eligible.sort(key=lambda item: (item[2], item[3], -item[1], item[0]))
+        selected = eligible[:count]
+        chosen = [str(index) for index, _, _, _ in selected]
+        details = ", ".join(
+            f"GPU {index} ({free_mb} MiB free, {used_mb} MiB used, {util}% util)"
+            for index, free_mb, used_mb, util in selected
+        )
+        print(f"[dagger] auto-selected {details}")
+    else:
+        if auto_count:
+            count = 1
+        launch["_resolved_num_processes"] = count
+        return env
+
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(chosen)
+    launch["_resolved_num_processes"] = count
+    return env
 
 
 def merge_datasets(sources: list[Path], accum: Path, horizon: int) -> Path:
@@ -114,6 +236,7 @@ def merge_datasets(sources: list[Path], accum: Path, horizon: int) -> Path:
 def build_train_cmd(cfg: dict, train_meta: Path, output_dir: Path, resume_ckpt: Path | None,
                     norm_path: Path, finetune: bool = False) -> list[str]:
     t, ln, m = cfg["train"], cfg["launch"], cfg["train"]["model"]
+    num_processes = int(ln.get("_resolved_num_processes", ln["num_processes"]))
     lr = t["finetune_learning_rate"] if finetune else t["learning_rate"]
     # YAML parses unquoted no/yes/on/off as bools; accelerate wants the literal
     # string "no"/"fp16"/"bf16"/"fp8". Map the bool trap back to "no".
@@ -121,7 +244,7 @@ def build_train_cmd(cfg: dict, train_meta: Path, output_dir: Path, resume_ckpt: 
     mp = "no" if mp is False else str(mp)
     cmd = [
         "accelerate", "launch",
-        "--num_processes", str(ln["num_processes"]),
+        "--num_processes", str(num_processes),
         "--main_process_port", str(ln["main_process_port"]),
         "--mixed_precision", mp,
         "train_smolvlm.py",
@@ -153,6 +276,8 @@ def build_train_cmd(cfg: dict, train_meta: Path, output_dir: Path, resume_ckpt: 
         "--lora_alpha", str(m["lora_alpha"]),
         "--lora_dropout", str(m["lora_dropout"]),
     ]
+    if num_processes > 1:
+        cmd.insert(2, "--multi_gpu")
     if t["use_cosine_decay"]:
         cmd.append("--use_cosine_decay")
     if t["gradient_checkpointing"]:
@@ -180,6 +305,7 @@ def main() -> None:
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     run, boot, roll, offm = cfg["run"], cfg["bootstrap"], cfg["rollout"], cfg["offmanifold"]
     norm_max = cfg["norm"]["max_samples"]
+    child_env = training_environment(cfg["launch"])
 
     out_root, data_root = Path(run["out_root"]), Path(run["data_root"])
     norm_dir = Path(cfg["paths"]["norm_stats"])
@@ -215,7 +341,7 @@ def main() -> None:
                 "--robot-noise", str(boot["robot_noise"]),
                 "--overwrite",
             ]
-            run_cmd(collect_cmd, None, "iter 0: expert rollout (collect.py)")
+            run_cmd(collect_cmd, None, "iter 0: expert rollout (collect.py)", child_env)
 
             bcmd = [
                 sys.executable, "-m", "cf_data.build",
@@ -227,7 +353,7 @@ def main() -> None:
             ]
             if boot["build"]["max_anchors"] is not None:
                 bcmd += ["--max-anchors", str(boot["build"]["max_anchors"])]
-            run_cmd(bcmd, None, "iter 0: build CF anchors (build.py normal)")
+            run_cmd(bcmd, None, "iter 0: build CF anchors (build.py normal)", child_env)
             train_meta = bootstrap_dir / "meta" / "cf_balanced.json"
         else:
             # 1. rollout model closed-loop + locate off-manifold threshold t*
@@ -253,7 +379,7 @@ def main() -> None:
             ]
             # Live terminal (log_path=None) so the tqdm replan bar shows; the
             # per-objective t*/off-manifold prints are the persisted diagnostics.
-            run_cmd(collect_cmd, None, f"iter {it}: rollout + off-manifold threshold")
+            run_cmd(collect_cmd, None, f"iter {it}: rollout + off-manifold threshold", child_env)
 
             # 2. fresh-oracle supervision on the off-manifold anchors
             build_cmd = [
@@ -263,7 +389,7 @@ def main() -> None:
                 "--horizon", str(cfg["dagger_build"]["horizon"]),
                 "--overwrite",
             ]
-            run_cmd(build_cmd, run_dir / "build.log", f"iter {it}: build fresh-oracle dagger anchors")
+            run_cmd(build_cmd, run_dir / "build.log", f"iter {it}: build fresh-oracle dagger anchors", child_env)
             dagger_dirs.append(dagger_data)
 
             # 3. accumulate bootstrap + all dagger dirs
@@ -274,10 +400,10 @@ def main() -> None:
         data_dir = train_meta.parent.parent
         norm_path = norm_dir / f"iter{it:02d}_norm.json"
         run_cmd(compute_norm_cmd(data_dir, norm_path, norm_max), run_dir / "norm.log",
-                f"iter {it}: compute norm stats from {data_dir}")
+                f"iter {it}: compute norm stats from {data_dir}", child_env)
 
         train_cmd = build_train_cmd(cfg, train_meta, run_dir, prev_ckpt, norm_path, finetune=(it >= 1))
-        run_cmd(train_cmd, None, f"iter {it}: train {cfg['train']['epochs']} epochs on {train_meta} (lr={'finetune' if it>=1 else 'base'})")
+        run_cmd(train_cmd, None, f"iter {it}: train {cfg['train']['epochs']} epochs on {train_meta} (lr={'finetune' if it>=1 else 'base'})", child_env)
 
         prev_ckpt = latest_ckpt(run_dir)
         prev_norm = norm_path

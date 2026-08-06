@@ -17,7 +17,7 @@ import json
 import random
 import numpy as np
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 from mmengine import fileio
 from .utils import action_slice, build_image_transform
 from .domain_config import DATA_WEIGHTS
@@ -36,6 +36,8 @@ class SmolVLMDataReader(IterableDataset):
         action_mode: str = "so101_delta",
         image_size: int = 384,
         samples_per_episode: int | None = None,
+        process_index: int = 0,
+        num_processes: int = 1,
     ):
         self.num_views = num_views
         self.training = training
@@ -43,6 +45,12 @@ class SmolVLMDataReader(IterableDataset):
         self.action_mode = action_mode
         self.image_size = image_size
         self.samples_per_episode = samples_per_episode
+        if not 0 <= process_index < num_processes:
+            raise ValueError(
+                f"process_index must be in [0, {num_processes}), got {process_index}"
+            )
+        self.process_index = process_index
+        self.num_processes = num_processes
         self.metas: Dict[str, dict] = {}
 
         print(f"[SmolVLM Dataset] Image size: {self.image_size}x{self.image_size}")
@@ -74,7 +82,9 @@ class SmolVLMDataReader(IterableDataset):
         self.image_aug = build_image_transform(self.image_size, True)
         self.image_no_aug = build_image_transform(self.image_size, False)
 
-    def _iter_one_dataset(self, dataset_name: str) -> Iterable[dict]:
+    def _iter_one_dataset(
+        self, dataset_name: str, shard_id: int, num_shards: int
+    ) -> Iterable[dict]:
         """Iterate over one dataset."""
         meta = self.metas[dataset_name]
         Handler = get_handler_cls(dataset_name)
@@ -85,10 +95,27 @@ class SmolVLMDataReader(IterableDataset):
         )
         while True:
             traj_indices = list(range(len(meta["datalist"])))
+            structured = dataset_name in (
+                "so101_balanced_counterfactual",
+                "cf_balanced",
+            )
+            # Structured handlers expose one synthetic trajectory and perform
+            # their own rank-aware sampling. Ordinary datasets are sharded by
+            # trajectory across all DDP ranks and DataLoader workers.
+            if not structured:
+                traj_indices = traj_indices[shard_id::num_shards]
+                if not traj_indices:
+                    raise RuntimeError(
+                        f"dataset {dataset_name!r} has fewer trajectories than "
+                        f"distributed shards ({num_shards})"
+                    )
             if self.training and not meta.get("preserve_order", False):
                 random.shuffle(traj_indices)
 
-            handler = Handler(meta=meta, num_views=self.num_views)
+            runtime_meta = dict(meta)
+            runtime_meta["_shard_id"] = shard_id
+            runtime_meta["_num_shards"] = num_shards
+            handler = Handler(meta=runtime_meta, num_views=self.num_views)
             for traj_idx in traj_indices:
                 try:
                     for sample in handler.iter_episode(
@@ -120,12 +147,17 @@ class SmolVLMDataReader(IterableDataset):
 
     def __iter__(self):
         """Main iteration."""
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+        shard_id = self.process_index * num_workers + worker_id
+        num_shards = self.num_processes * num_workers
         names = list(self.metas.keys())
         if not self.training:
             for n in names:
-                yield from self._iter_one_dataset(n)
+                yield from self._iter_one_dataset(n, shard_id, num_shards)
         else:
-            gens = [iter(self._iter_one_dataset(n)) for n in names]
+            gens = [iter(self._iter_one_dataset(n, shard_id, num_shards)) for n in names]
             ws = [DATA_WEIGHTS.get(n, 1.0) for n in names]
             s = sum(ws)
             ws = [w / s for w in ws]
@@ -144,6 +176,8 @@ def create_smolvlm_dataloader(
     image_size: int = 384,
     num_views: int = 3,
     samples_per_episode: int | None = None,
+    process_index: int = 0,
+    num_processes: int = 1,
 ):
     """Create a DataLoader for SmolVLM-VLA training.
 
@@ -165,6 +199,8 @@ def create_smolvlm_dataloader(
         image_size=image_size,
         num_views=num_views,
         samples_per_episode=samples_per_episode,
+        process_index=process_index,
+        num_processes=num_processes,
     )
 
     structured = [

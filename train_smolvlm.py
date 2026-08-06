@@ -464,6 +464,8 @@ def main(args):
         image_size=args.image_size,
         num_views=args.num_views,
         samples_per_episode=args.samples_per_episode,
+        process_index=accelerator.process_index,
+        num_processes=accelerator.num_processes,
     )
 
     # Optimizer
@@ -476,11 +478,13 @@ def main(args):
     )
     if args.epochs:
         samples = _samples_per_epoch(args.train_metas_path)
-        batches_per_epoch = max(1, samples // args.batch_size)
+        global_batch_size = args.batch_size * accelerator.num_processes
+        batches_per_epoch = max(1, math.ceil(samples / global_batch_size))
         args.iters = args.epochs * batches_per_epoch
         logger.info(
             f"Epoch mode: {args.epochs} epochs x {batches_per_epoch} batches/epoch "
-            f"({samples} samples, batch_size={args.batch_size}) = {args.iters} steps"
+            f"({samples} samples, per_device_batch_size={args.batch_size}, "
+            f"global_batch_size={global_batch_size}) = {args.iters} steps"
         )
     optimizer_restored = False
     if args.resume and load_path and os.path.isdir(load_path):
@@ -551,8 +555,14 @@ def main(args):
 
         # Logging
         if global_step % args.log_interval == 0:
-            logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
-            logs["loss_total"] = float(loss.detach().item())
+            # Report global means rather than rank-0's local shard only.
+            logs = {
+                k: accelerator.reduce(v.detach().float(), reduction="mean").item()
+                for k, v in loss_dict.items()
+            }
+            logs["loss_total"] = accelerator.reduce(
+                loss.detach().float(), reduction="mean"
+            ).item()
             logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
             accelerator.log(logs, step=global_step)
 
