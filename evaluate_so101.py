@@ -22,7 +22,7 @@ from cf_data.core import (
     OBJECTIVE_COLORS,
     TARGET_COLORS,
     get_gripper_limits,
-    instruction,
+    instruction as build_instruction,
 )
 
 
@@ -82,7 +82,9 @@ def main() -> None:
     try:
         obs, info = env.reset(seed=args.seed)
         env.set_objective(args.objective_id, args.target_id)
-        instruction = args.instruction or instruction(args.objective_id, args.target_id, 0)
+        instruction_text = args.instruction or build_instruction(
+            args.objective_id, args.target_id, 0
+        )
         limits = get_gripper_limits(env)
         torch.manual_seed(args.seed if args.policy_seed is None else args.policy_seed)
 
@@ -101,7 +103,7 @@ def main() -> None:
                 np.asarray(obs["state"], dtype=np.float64),
                 gripper_limits_rad=limits,
             )
-            language = processor.encode_language([instruction])
+            language = processor.encode_language([instruction_text])
             with torch.inference_mode(), torch.autocast(
                 device_type=device.type,
                 dtype=autocast_dtype,
@@ -147,7 +149,7 @@ def main() -> None:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     media.write_video(args.output, frames, fps=25)
-    print(f"instruction: {instruction}")
+    print(f"instruction: {instruction_text}")
     print(f"success: {bool(info.get('success', False))}")
     print(f"is_obj_placed: {bool(info.get('is_obj_placed', False))}")
     print(f"is_grasped: {bool(info.get('is_grasped', False))}")
