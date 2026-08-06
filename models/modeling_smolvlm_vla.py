@@ -25,6 +25,17 @@ from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
 
 
+def _module_float_dtype(module: torch.nn.Module) -> torch.dtype:
+    """Return a module's floating-point parameter/buffer dtype."""
+    for tensor in module.parameters():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    for tensor in module.buffers():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    return torch.float32
+
+
 def _sample_flow_time_and_noise(
     action: torch.Tensor,
     flow_group_id: torch.Tensor | None,
@@ -258,6 +269,13 @@ class SmolVLMVLA(PreTrainedModel):
         
         if valid_images.shape[0] == 0:
             raise ValueError("At least one image view must be valid.")
+
+        # Checkpoints may intentionally keep the VLM in BF16/FP16 while image
+        # transforms produce FP32. Do not rely on an outer autocast context:
+        # dagger collection and other inference callers invoke this method
+        # directly.
+        vision_dtype = _module_float_dtype(self.vlm.model.vision_model)
+        valid_images = valid_images.to(dtype=vision_dtype)
         
         # Encode images through SmolVLM's vision encoder (SigLIP)
         vision_outputs = self.vlm.model.vision_model(
@@ -405,11 +423,12 @@ class SmolVLMVLA(PreTrainedModel):
         u_t = _flow_target_velocity(action_norm, noise)
 
         # Model prediction (no aux_visual_inputs for SmolVLM)
+        transformer_dtype = _module_float_dtype(self.transformer)
         v_t = self.transformer(
-            vlm_features=enc["vlm_features"],
-            action_with_noise=x_t,
-            t=t,
-            proprio=proprio_norm,
+            vlm_features=enc["vlm_features"].to(dtype=transformer_dtype),
+            action_with_noise=x_t.to(dtype=transformer_dtype),
+            t=t.to(dtype=transformer_dtype),
+            proprio=proprio_norm.to(dtype=transformer_dtype),
         )
         
         # MSE loss
@@ -464,14 +483,19 @@ class SmolVLMVLA(PreTrainedModel):
             proprio_norm = proprio
 
         x_1 = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
+        transformer_dtype = _module_float_dtype(self.transformer)
+        transformer_features = enc["vlm_features"].to(dtype=transformer_dtype)
+        transformer_proprio = proprio_norm.to(dtype=transformer_dtype)
 
         def velocity_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            return self.transformer(
-                vlm_features=enc["vlm_features"],
-                action_with_noise=x_t,
-                proprio=proprio_norm,
-                t=t,
+            velocity = self.transformer(
+                vlm_features=transformer_features,
+                action_with_noise=x_t.to(dtype=transformer_dtype),
+                proprio=transformer_proprio,
+                t=t.to(dtype=transformer_dtype),
             )
+            # Keep Euler state in the caller's/action-space dtype.
+            return velocity.to(dtype=x_t.dtype)
 
         x_t = _euler_integrate_flow(x_1, steps, velocity_fn)
         
