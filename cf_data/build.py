@@ -3,7 +3,7 @@
 Reads the Stage-A nominal dataset (episodes/*.npz + meta/nominal_episodes.jsonl) and
 emits, into the same directory:
 
-  * cf_anchors/an_<anchor_id>.npz  -- per anchor, future proprio chunks for every
+  * cf_anchors/an_<anchor_id>.npz  -- per anchor, expert command chunks for every
     branch (NUM_OBJECTIVES for a REACH_PICK source-CF group, NUM_TARGETS for a
     REACH_PLACE target-CF group, 1 for a nominal-only anchor).
   * meta/anchors.jsonl            -- one line per anchor (output C, the balanced
@@ -95,18 +95,18 @@ def _load_nominal(in_dir: Path) -> list[dict]:
 
 
 def _future_from_nominal(ep: dict, t: int, horizon: int) -> np.ndarray:
-    """Future proprio chunk [horizon, D] = nominal state[t+1 : t+1+H], repeat-last padded.
+    """Recover expert position commands from the next frame's held controller target.
 
-    If the anchor is at the episode tail with no remaining future, hold the anchor
-    proprio so the chunk is well-formed (callers filter such anchors out, this is a
-    defensive backstop).
+    Frame t is recorded immediately before action[t] is applied. Consequently
+    snapshot.ctrl[t+1] equals action[t]. The final unobserved command cannot be
+    recovered and tail chunks repeat the last known command.
     """
-    future = ep["state"][t + 1 : t + 1 + horizon]
-    if len(future) == 0:
-        future = np.repeat(ep["state"][t : t + 1], horizon, axis=0)
-    elif len(future) < horizon:
-        future = np.concatenate([future, np.repeat(future[-1:], horizon - len(future), axis=0)])
-    return future.astype(np.float32)
+    ctrl = ep["snap_ctrl"][t + 1 : t + 1 + horizon]
+    if len(ctrl) == 0:
+        ctrl = ep["snap_ctrl"][t : t + 1]
+    if len(ctrl) < horizon:
+        ctrl = np.concatenate([ctrl, np.repeat(ctrl[-1:], horizon - len(ctrl), axis=0)])
+    return np.stack([qpos_to_row(row) for row in ctrl]).astype(np.float32)
 
 
 def _cf_valid(env, snap: Snapshot, source_id: int, target_id: int,
@@ -126,7 +126,7 @@ def _cf_valid(env, snap: Snapshot, source_id: int, target_id: int,
 
 
 def _roll_cf(env, snap: Snapshot, source_id: int, target_id: int, horizon: int) -> np.ndarray:
-    """Roll a fresh oracle for (source,target) from the anchor state; render-free, repeat-last padded."""
+    """Roll a fresh oracle and retain its actual absolute joint-position commands."""
     restore_snapshot(env, snap)
     env.set_objective(source_id, target_id)
     oracle = Oracle(ENV_ID, env)
@@ -135,8 +135,8 @@ def _roll_cf(env, snap: Snapshot, source_id: int, target_id: int, horizon: int) 
         if oracle.finished:
             break
         action, _ = oracle.select_action()
+        chunk.append(qpos_to_row(action))
         step_physics(env, action)
-        chunk.append(qpos_to_row(env._get_current_qpos()))
     if not chunk:  # oracle already finished at the anchor (degenerate); hold the anchor
         chunk.append(qpos_to_row(env._get_current_qpos()))
     while len(chunk) < horizon:
@@ -345,43 +345,6 @@ def _build_nominal_branch(
     )
 
 
-def _build_dagger_branch(env, episodes, ep_idx, t, horizon):
-    """DAgger anchor: one branch, future chunk = fresh oracle rollout from the
-    model-visited anchor state (NOT the stored continuation, which would be the
-    policy's own off-manifold trajectory). Returns None if the oracle cannot
-    plan from this state, so the caller skips the anchor.
-    """
-    ep = episodes[ep_idx]
-    obj_id = int(ep["meta"]["objective_id"])
-    tgt = int(ep["meta"]["target_id"])
-    snap = Snapshot(ep["snap_qpos"][t], ep["snap_qvel"][t], ep["snap_ctrl"][t])
-    try:
-        future = _roll_cf(env, snap, obj_id, tgt, horizon)
-    except (RuntimeError, ValueError):
-        # Off-manifold anchor poses can put q0 outside the IK bounds
-        # (least_squares ValueError); skip this anchor (no oracle supervision).
-        return None
-    anchor_id = _anchor_id(ep["meta"]["episode_id"], t)
-    variant = variant_for(anchor_id)
-    branches = [
-        {
-            "branch_id": f"{anchor_id}_s{obj_id}_t{tgt}",
-            "objective_id": obj_id,
-            "source_id": obj_id,
-            "target_id": tgt,
-            "instruction": instruction(obj_id, tgt, variant),
-            "is_counterfactual": False,
-        }
-    ]
-    return (
-        future[None].astype(np.float32),
-        np.asarray([obj_id], dtype=np.int8),
-        np.asarray([tgt], dtype=np.int8),
-        np.asarray([False], dtype=bool),
-        branches,
-    )
-
-
 def build(args: argparse.Namespace) -> Path:
     in_dir: Path = args.in_dir.resolve()
     if not (in_dir / "meta" / "nominal_episodes.jsonl").exists():
@@ -394,6 +357,10 @@ def build(args: argparse.Namespace) -> Path:
     cf_anchors.mkdir()
 
     info = json.loads((in_dir / "meta" / "info.json").read_text())
+    info["action_semantics"] = "pd_joint_pos_command_recoverable_from_snapshot_ctrl"
+    (in_dir / "meta" / "info.json").write_text(
+        json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     height, width, _ = info["image_shape"]
     num_objectives = info["num_objectives"]
     num_targets = info["num_targets"]
@@ -403,47 +370,29 @@ def build(args: argparse.Namespace) -> Path:
     env = make_env(width, height, source_index=0, robot_init_qpos_noise=0.0)
 
     pools = _scan_anchors(episodes, args.anchor_stride)
-    if args.dagger:
-        # DAgger: no counterfactual swaps. Every model-visited anchor is a candidate;
-        # supervision comes from a fresh oracle rollout at build time, so we keep all
-        # phases (capped per phase by --max-anchors if given) and skip anchors the
-        # oracle cannot plan from.
-        valid_rp = pools[REACH_PICK]
-        valid_place = pools[REACH_PLACE]
-        phase_counts = {
-            "REACH_PICK": len(pools[REACH_PICK]),
-            "GRASP": len(pools[GRASP]),
-            "REACH_PLACE": len(pools[REACH_PLACE]),
-            "PLACE": len(pools[PLACE]),
-        }
-        cap = args.max_anchors if args.max_anchors is not None else 10**9
-        rng = np.random.default_rng(args.seed)
-        sampled = {p: [pools[p][i] for i in rng.permutation(len(pools[p]))[:cap]] for p in PHASE_POOLS}
-        n_rp = sum(len(sampled[p]) for p in PHASE_POOLS)  # total candidates (dagger has no per-phase balance)
-    else:
-        valid_rp = _filter_rp(env, episodes, pools[REACH_PICK], num_objectives)
-        valid_place = _filter_place(env, episodes, pools[REACH_PLACE], num_targets)
-        phase_counts = {
-            "REACH_PICK": len(valid_rp),
-            "GRASP": len(pools[GRASP]),
-            "REACH_PLACE": len(valid_place),
-            "PLACE": len(pools[PLACE]),
-        }
-        n_rp = min(len(valid_rp), len(valid_place), len(pools[GRASP]), len(pools[PLACE]))
-        if args.max_anchors is not None:
-            n_rp = min(n_rp, args.max_anchors)
+    valid_rp = _filter_rp(env, episodes, pools[REACH_PICK], num_objectives)
+    valid_place = _filter_place(env, episodes, pools[REACH_PLACE], num_targets)
+    phase_counts = {
+        "REACH_PICK": len(valid_rp),
+        "GRASP": len(pools[GRASP]),
+        "REACH_PLACE": len(valid_place),
+        "PLACE": len(pools[PLACE]),
+    }
+    n_rp = min(len(valid_rp), len(valid_place), len(pools[GRASP]), len(pools[PLACE]))
+    if args.max_anchors is not None:
+        n_rp = min(n_rp, args.max_anchors)
 
-        rng = np.random.default_rng(args.seed)
-        sampled = {
-            REACH_PICK: [valid_rp[i] for i in rng.permutation(len(valid_rp))[:n_rp]],
-            GRASP: [pools[GRASP][i] for i in rng.permutation(len(pools[GRASP]))[:n_rp]],
-            REACH_PLACE: [valid_place[i] for i in rng.permutation(len(valid_place))[:n_rp]],
-            PLACE: [pools[PLACE][i] for i in rng.permutation(len(pools[PLACE]))[:n_rp]],
-        }
+    rng = np.random.default_rng(args.seed)
+    sampled = {
+        REACH_PICK: [valid_rp[i] for i in rng.permutation(len(valid_rp))[:n_rp]],
+        GRASP: [pools[GRASP][i] for i in rng.permutation(len(pools[GRASP]))[:n_rp]],
+        REACH_PLACE: [valid_place[i] for i in rng.permutation(len(valid_place))[:n_rp]],
+        PLACE: [pools[PLACE][i] for i in rng.permutation(len(pools[PLACE]))[:n_rp]],
+    }
 
     anchor_records: list[dict] = []
     eval_records: list[dict] = []
-    counts = {"anchors": 0, "branches": 0, "cf_branches": 0, "nominal_branches": 0, "dagger_skips": 0}
+    counts = {"anchors": 0, "branches": 0, "cf_branches": 0, "nominal_branches": 0}
     samples_per_phase = {p: 0 for p in PHASE_POOLS}
     samples_per_objective = {j: 0 for j in range(num_objectives)}
     samples_per_target = {k: 0 for k in range(num_targets)}
@@ -455,13 +404,7 @@ def build(args: argparse.Namespace) -> Path:
         ep = episodes[ep_idx]
         meta = ep["meta"]
         anchor_id = _anchor_id(meta["episode_id"], t)
-        if args.dagger:
-            out = _build_dagger_branch(env, episodes, ep_idx, t, args.horizon)
-            if out is None:
-                counts["dagger_skips"] += 1
-                return
-            future_chunks, obj_ids, tgt_ids, cf_flags, branches = out
-        elif phase == REACH_PICK:
+        if phase == REACH_PICK:
             future_chunks, obj_ids, tgt_ids, cf_flags, branches = _build_rp_group(
                 env, episodes, ep_idx, t, args.horizon, num_objectives
             )
@@ -551,11 +494,8 @@ def build(args: argparse.Namespace) -> Path:
         "anchor_stride": args.anchor_stride,
     }
     (in_dir / "meta" / "stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    # Training meta consumed by simvla_datasets.dataset_smolvlm + the cf_balanced
-    # handler. Point the training --dataset at this file. Image augmentation is
-    # disabled so the shared anchor image stays identical across the branches of a
-    # group (criterion 6); the handler only needs num_workers=0 (enforced in the
-    # dataloader), so batch_size is unconstrained.
+    # Dataset summary. The SmolVLA adapter reads anchors.jsonl directly and keeps
+    # the same unaugmented observation for every branch of an anchor.
     training_meta = {
         "dataset_name": "cf_balanced",
         "data_dir": str(args.in_dir),
@@ -572,20 +512,13 @@ def build(args: argparse.Namespace) -> Path:
     (in_dir / "meta" / "cf_balanced.json").write_text(
         json.dumps(training_meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    if args.dagger:
-        print(
-            f"[dagger] anchors={counts['anchors']} branches={counts['branches']} "
-            f"skipped(off-manifold, oracle-unreachable)={counts['dagger_skips']} "
-            f"candidates={n_rp}"
-        )
-    else:
-        print(
-            f"anchors={counts['anchors']} branches={counts['branches']} "
-            f"(nominal={counts['nominal_branches']} cf={counts['cf_branches']}) "
-            f"ratio_nominal={stats['nominal_counterfactual_ratio']} "
-            f"valid_cf_groups={len(valid_rp)} valid_place_groups={len(valid_place)} "
-            f"rejected={rejected_rp + rejected_place} n_rp={n_rp}"
-        )
+    print(
+        f"anchors={counts['anchors']} branches={counts['branches']} "
+        f"(nominal={counts['nominal_branches']} cf={counts['cf_branches']}) "
+        f"ratio_nominal={stats['nominal_counterfactual_ratio']} "
+        f"valid_cf_groups={len(valid_rp)} valid_place_groups={len(valid_place)} "
+        f"rejected={rejected_rp + rejected_place} n_rp={n_rp}"
+    )
     print(f"samples_per_phase={stats['samples_per_phase']}")
     print(f"samples_per_objective={stats['samples_per_objective']}")
     print(f"samples_per_target={stats['samples_per_target']}")
@@ -599,7 +532,6 @@ def main() -> None:
     parser.add_argument("--anchor-stride", type=int, default=8, help="stride for REACH_PICK anchor candidates")
     parser.add_argument("--max-anchors", type=int, default=None, help="cap N_rp per phase")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--dagger", action="store_true", help="DAgger mode: single branch per anchor, future from fresh oracle rollout (skip CF swaps)")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.horizon < 1:

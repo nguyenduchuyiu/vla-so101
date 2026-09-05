@@ -1,0 +1,10 @@
+# Isolated environment: uv venv .venv-smolvla --python 3.12
+# uv pip install --python .venv-smolvla/bin/python -r requirements-smolvla.txt
+lerobot[smolvla,dataset]==0.6.1
+torch==2.11.0
+torchvision==0.26.0
+transformers==5.5.4
+numpy==2.2.6
+so101-nexus==0.4.10
+mujoco==3.10.0
+mediapy==1.2.7

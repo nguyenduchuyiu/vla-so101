@@ -1,5 +1,12 @@
 # Python
 .venv/
+.venv-smolvla/
+tests/smolvla/run/
+tests/smolvla/delta_run/
+tests/smolvla/command_run/
+tests/smolvla/dataset/
+tests/smolvla/*.log
+tests/smolvla/*.mp4
 venv/
 env/
 **/__pycache__/

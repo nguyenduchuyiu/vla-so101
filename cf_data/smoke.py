@@ -2,7 +2,7 @@
 
 Runs the full collect -> build path on a tiny 1-scene dataset, then checks every
 plan §13 acceptance criterion against the produced files and confirms the
-cf_balanced handler + dataloader yield a valid batch. Writes a detailed log to
+SmolVLA CF adapter + dataloader yield a valid batch. Writes a detailed log to
 ``<out>/smoke.log`` and prints one PASS/FAIL line per criterion.
 
 Run:  python -m cf_data.smoke --out data/cf_smoke_test --overwrite
@@ -31,9 +31,7 @@ from cf_data.core import (
     instruction,
     variant_for,
 )
-from models.action_hub import SO101DeltaActionSpace
-from simvla_datasets.dataset_smolvlm import create_smolvlm_dataloader
-from simvla_datasets.utils import action_slice
+from smolvla_cf.data import CounterfactualDataset, from_delta_joint, to_delta_joint
 
 D = 6
 
@@ -168,21 +166,18 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
     _check(10, "anchor branches not split across splits", not bad,
            f"checked {len(anchors)} anchors, split_conflicts={bad[:3]}", log, results)
 
-    # 11. Action chunk computed consistently from future proprio (abs_traj = [proprio, future]).
-    space = SO101DeltaActionSpace()
+    # 11. Delta-joint encoding must recover the stored future exactly.
     a0 = rp[0]
     npz = np.load(out / a0["cf_path"])
     proprio = npz["anchor_proprio"].astype(np.float32)
     future = npz["future_chunks"][0].astype(np.float32)
     H = min(10, future.shape[0])
-    abs_traj = torch.as_tensor(np.concatenate([proprio[None], future[:H]], axis=0), dtype=torch.float32)
-    sl = action_slice(abs_traj)
-    delta = space._to_delta(sl["proprio"], sl["action"])
-    ok = bool(torch.allclose(sl["proprio"], torch.as_tensor(proprio, dtype=torch.float32))) and \
-         bool(torch.allclose(sl["action"], torch.as_tensor(future[:H], dtype=torch.float32))) and \
-         bool(torch.allclose(delta[..., :5], sl["action"][..., :5] - sl["proprio"][..., None, :5]))
-    _check(11, "action chunk consistent from future proprio", ok,
-           f"proprio==abs[0], action==future[:H], delta[:5]=future-current (H={H})", log, results)
+    delta = to_delta_joint(future[:H], proprio)
+    ok = proprio.shape == (D,) and future[:H].shape == (H, D) and np.isfinite(future).all() and \
+         np.allclose(from_delta_joint(delta, proprio), future[:H], atol=1e-5) and \
+         np.array_equal(delta[:, 5], future[:H, 5])
+    _check(11, "delta action chunk recovers expert command", ok,
+           f"delta+anchor==future[:H], absolute gripper (H={H})", log, results)
 
     # eval_pairs == test-split REACH_PICK + REACH_PLACE CF groups (output D).
     test_cf = [a for a in anchors if a["split"] == "test" and a["phase"] in (REACH_PICK, REACH_PLACE)]
@@ -199,17 +194,14 @@ def _dataloader_batch(out: Path, log: io.StringIO) -> bool:
         log.write(f"DATALOADER: meta missing {meta_path}\n")
         print("FAIL  dataloader  cf_balanced.json missing (build did not emit training meta)")
         return False
-    loader = create_smolvlm_dataloader(
-        batch_size=10, metas_path=str(meta_path), num_actions=10, training=True,
-        action_mode="so101_delta", num_workers=0, image_size=96, num_views=2,
-    )
+    dataset = CounterfactualDataset(out, chunk_size=10, split="all")
+    loader = torch.utils.data.DataLoader(dataset, batch_size=10, num_workers=0)
     batch = next(iter(loader))
     keys = set(batch.keys())
-    expected = {"language_instruction", "image_input", "image_mask", "proprio", "action", "flow_group_id"}
+    expected = {"task", "observation.images.camera1", "observation.images.camera2", "observation.state", "action"}
     ok = expected.issubset(keys)
-    detail = (f"keys={sorted(keys)} image_input={tuple(batch['image_input'].shape)} "
-              f"action={tuple(batch['action'].shape)} proprio={tuple(batch['proprio'].shape)} "
-              f"flow_group_id={batch['flow_group_id'].tolist()[:6]}")
+    detail = (f"keys={sorted(keys)} camera1={tuple(batch['observation.images.camera1'].shape)} "
+              f"action={tuple(batch['action'].shape)} state={tuple(batch['observation.state'].shape)}")
     print(f"{'PASS' if ok else 'FAIL'}  dataloader  one batch")
     log.write(f"DATALOADER: {detail}\n")
     return ok
@@ -238,7 +230,7 @@ def main() -> None:
         with redirect_stdout(log):
             collect_fn(cargs)
         bargs = argparse.Namespace(in_dir=out, horizon=32, anchor_stride=args.anchor_stride,
-                                    max_anchors=args.max_anchors, seed=args.seed, overwrite=True, dagger=False)
+                                    max_anchors=args.max_anchors, seed=args.seed, overwrite=True)
         with redirect_stdout(log):
             build_fn(bargs)
     except Exception as exc:  # noqa: BLE001 -- surface any pipeline failure

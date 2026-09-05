@@ -238,7 +238,7 @@ def collect(args: argparse.Namespace) -> Path:
         "image_shape": [height, width, 3],
         "control_dt": CONTROL_DT,
         "fps": int(round(1.0 / CONTROL_DT)),
-        "action_semantics": "absolute_joint_position",
+        "action_semantics": "pd_joint_pos_command_recoverable_from_snapshot_ctrl",
         "joint_order": ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"],
         "units": {
             "observation.state[0:5]": "degrees",
