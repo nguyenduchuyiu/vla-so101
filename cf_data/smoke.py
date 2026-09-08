@@ -80,21 +80,22 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
     _check(3, "nominal samples balanced per phase", ok,
            f"anchors(=nominal_branches)_per_phase={anchors_per_phase} stats.samples_per_phase={stats['samples_per_phase']}", log, results)
 
-    # 4. CF groups: REACH_PICK = 1 nominal + (NUM_OBJECTIVES-1) CF; REACH_PLACE = 1 nominal + (NUM_TARGETS-1) CF.
+    # 4. Every group keeps its nominal branch. Individual CF rollouts may be
+    #    dropped if execution fails, without discarding the whole anchor/scene.
     rp = [a for a in anchors if a["phase"] == REACH_PICK]
     place = [a for a in anchors if a["phase"] == REACH_PLACE]
     bad = []
     for a in rp:
         npz = np.load(out / a["cf_path"])
         cf = npz["is_counterfactual"]
-        if a["n_branches"] != NUM_OBJECTIVES or int(cf.sum()) != NUM_OBJECTIVES - 1 or int((~cf).sum()) != 1:
+        if not 1 <= a["n_branches"] <= NUM_OBJECTIVES or int((~cf).sum()) != 1:
             bad.append(a["anchor_id"])
     for a in place:
         npz = np.load(out / a["cf_path"])
         cf = npz["is_counterfactual"]
-        if a["n_branches"] != NUM_TARGETS or int(cf.sum()) != NUM_TARGETS - 1 or int((~cf).sum()) != 1:
+        if not 1 <= a["n_branches"] <= NUM_TARGETS or int((~cf).sum()) != 1:
             bad.append(a["anchor_id"])
-    _check(4, "CF groups: RP 1+(O-1), PLACE 1+(K-1)", len(rp) > 0 and len(place) > 0 and not bad,
+    _check(4, "CF groups retain nominal; failed CF branches drop individually", len(rp) > 0 and len(place) > 0 and not bad,
            f"rp_groups={len(rp)} place_groups={len(place)} bad={bad[:3]}", log, results)
 
     # 5. Branches of a group start from the same state (shared anchor_proprio == nominal state[frame]).
@@ -109,8 +110,7 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
     _check(5, "branches share anchor state", not bad,
            f"checked {len(rp)} groups, mismatches={bad[:3]}", log, results)
 
-    # 6. Nominal & CF branches share image + proprio at anchor (proprio shared by construction;
-    #    image = nominal frame t, used by all branches via the handler).
+    # 6. Nominal & CF trajectories share image + proprio at the anchor.
     bad = []
     for a in rp:
         npz = np.load(out / a["cf_path"])
@@ -118,8 +118,16 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
         img = ep["observation.images.overhead"][a["anchor_frame"]]
         if not np.allclose(npz["anchor_proprio"], ep["observation.state"][a["anchor_frame"]], atol=1e-5):
             bad.append(a["anchor_id"])
+        for branch in a["branches"]:
+            if not branch["is_counterfactual"]:
+                continue
+            with np.load(out / branch["trajectory_path"]) as trajectory:
+                if not np.array_equal(trajectory["observation.images.overhead"][0], img):
+                    bad.append((a["anchor_id"], branch["branch_id"], "image"))
+                if not np.allclose(trajectory["observation.state"][0], npz["anchor_proprio"], atol=1e-5):
+                    bad.append((a["anchor_id"], branch["branch_id"], "state"))
     _check(6, "shared image + proprio at anchor", not bad,
-           f"anchor_proprio==nominal_state[frame] for {len(rp)} groups; image read from nominal frame t by handler", log, results)
+           f"checked full CF trajectory frame zero for {len(rp)} groups; mismatches={bad[:3]}", log, results)
 
     # 7. Each branch instruction is a valid paraphrase of its (source,target) and CF futures diverge from nominal.
     bad = []
@@ -139,11 +147,10 @@ def _verify(out: Path, log: io.StringIO) -> tuple[list, dict]:
     _check(7, "branch instruction + future match objective", not bad,
            f"checked {len(rp) + len(place)} groups, violations={bad[:3]}", log, results)
 
-    # 8. nominal/total = 4/(NUM_OBJECTIVES + NUM_TARGETS + 2) (=0.4 for 5 sources, 3 targets):
-    #    4 nominal branches/anchor (one per phase) vs (O-1)+(K-1) CF branches/anchor.
-    expected_ratio = 4.0 / (NUM_OBJECTIVES + NUM_TARGETS + 2)
+    # 8. Reported nominal/total ratio matches the branches that survived rollout.
+    expected_ratio = stats["num_nominal_branches"] / stats["num_branches"]
     ratio = stats["nominal_counterfactual_ratio"]
-    _check(8, f"nominal/total ~ {expected_ratio:.2f}", abs(ratio - expected_ratio) <= 0.02,
+    _check(8, f"nominal/total == {expected_ratio:.2f}", abs(ratio - expected_ratio) <= 1e-4,
            f"ratio={ratio} expected={expected_ratio:.4f} nominal={stats['num_nominal_branches']} cf={stats['num_cf_branches']}", log, results)
 
     # 9. All branches retrievable from anchor_id.
@@ -216,6 +223,7 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=96)
     parser.add_argument("--height", type=int, default=96)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -226,11 +234,13 @@ def main() -> None:
 
     try:
         cargs = argparse.Namespace(out=out, scenes=args.scenes, seed=args.seed, width=args.width,
-                                    height=args.height, robot_noise=0.02, overwrite=True)
+                                    height=args.height, robot_noise=0.02,
+                                    workers=args.workers, overwrite=True)
         with redirect_stdout(log):
             collect_fn(cargs)
         bargs = argparse.Namespace(in_dir=out, horizon=32, anchor_stride=args.anchor_stride,
-                                    max_anchors=args.max_anchors, seed=args.seed, overwrite=True)
+                                    max_anchors=args.max_anchors, seed=args.seed,
+                                    workers=args.workers, overwrite=True)
         with redirect_stdout(log):
             build_fn(bargs)
     except Exception as exc:  # noqa: BLE001 -- surface any pipeline failure

@@ -1,30 +1,45 @@
-"""Anchor/branch samples for LeRobot; CF continuations have no future images."""
+"""SO101 counterfactual dataset adapters and delta-joint conversion."""
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from cf_data.core import OBJECTIVE_COLORS as OBJECT_COLORS
+from cf_data.core import TARGET_COLORS
+
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 CAMERAS = {
     "observation.images.camera1": "observation.images.overhead",
     "observation.images.camera2": "observation.images.wrist",
 }
+NUM_OBJECTIVES = len(OBJECT_COLORS) * len(TARGET_COLORS)
+
+
+def objective_id_from_task(task: str) -> int:
+    """Collapse linguistic task variants to one of the 5 x 3 objectives."""
+    words = set(re.findall(r"[a-z]+", task.lower()))
+    objects = [i for i, color in enumerate(OBJECT_COLORS) if color in words]
+    targets = [i for i, color in enumerate(TARGET_COLORS) if color in words]
+    if len(objects) != 1 or len(targets) != 1:
+        raise ValueError(f"Cannot identify exactly one object and target in task: {task!r}")
+    return objects[0] * len(TARGET_COLORS) + targets[0]
 
 
 def to_delta_joint(future, anchor_state):
-    """Arm targets relative to the chunk's fixed anchor; gripper stays absolute."""
+    """Arm targets relative to one reference frame state; gripper stays absolute."""
     action = np.array(future, dtype=np.float32, copy=True)
     action[..., :5] -= np.asarray(anchor_state)[..., :5]
     return action
 
 
 def from_delta_joint(action, anchor_state):
-    """Invert once against the same anchor, never cumulatively or per-step state."""
+    """Invert once against the same reference state, never cumulatively."""
     future = np.array(action, dtype=np.float32, copy=True)
     future[..., :5] += np.asarray(anchor_state)[..., :5]
     return future
@@ -127,23 +142,21 @@ class CounterfactualDataset(Dataset):
 
 
 class LeRobotCFDataset(Dataset):
-    """Read canonical LeRobot storage, selecting its explicit CF chunk feature.
-
-    Each episode has exactly one real observation; standard temporal action
-    lookup would repeat that frame, so no delta_timestamps are used here.
-    """
+    """Read full 30 Hz branch trajectories and their explicit padded chunks."""
 
     def __init__(self, root, chunk_size=50, split="train"):
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         self.root = Path(root)
         self._contract = json.loads((self.root / "meta/cf_contract.json").read_text())
-        if self._contract["action_semantics"] != "arm_delta_from_chunk_anchor_gripper_absolute":
-            raise ValueError("Expected delta-joint CF data")
+        if self._contract["action_semantics"] != "arm_delta_from_frame_state_gripper_absolute":
+            raise ValueError("Expected per-frame delta-joint CF data")
         if chunk_size != self._contract["chunk_size"]:
             raise ValueError("Training chunk_size must match the exported CF chunk")
         records = [json.loads(line) for line in (self.root / "meta/cf_samples.jsonl").read_text().splitlines()]
-        self.indices = [i for i, row in enumerate(records) if split == "all" or row["split"] == split]
+        if any(row.get("row_index") != i for i, row in enumerate(records)):
+            raise ValueError("CF manifest row indices are not contiguous")
+        self.indices = [row["row_index"] for row in records if split == "all" or row["split"] == split]
         if not self.indices:
             raise ValueError(f"No anchors in split={split!r}; --split all is only for explicit overfit experiments")
         self.dataset = LeRobotDataset(repo_id=self._contract["repo_id"], root=self.root)
@@ -164,6 +177,7 @@ class LeRobotCFDataset(Dataset):
             "observation.state": row["observation.state"],
             "task": row["task"],
             "action": row["cf.action_chunk"],
+            "action_is_pad": row["action_is_pad"],
         }
 
     def stats(self):
@@ -172,3 +186,89 @@ class LeRobotCFDataset(Dataset):
 
     def contract(self):
         return {**self._contract, "split": self.split, "num_samples": len(self)}
+
+
+class ACTCFDataset(Dataset):
+    """ACT view of the same CF rows, with the objective appended to proprioception.
+
+    The observation alone is ambiguous because every scene is paired with all 15
+    counterfactual objectives. Conditioning the CVAE and decoder on a 15-way
+    objective vector prevents those action labels from being averaged together.
+    """
+
+    def __init__(self, root, chunk_size=50, split="train"):
+        self.base = LeRobotCFDataset(root, chunk_size, split)
+        self.root = self.base.root
+        self.info = self.base.info
+        self.split = split
+        self.chunk_size = chunk_size
+
+        task_to_index = {
+            str(task): int(row.task_index)
+            for task, row in self.base.dataset.meta.tasks.iterrows()
+        }
+        index_to_objective = {
+            task_index: objective_id_from_task(task)
+            for task, task_index in task_to_index.items()
+        }
+        # Go through Arrow once. Indexing a formatted Hugging Face column row by
+        # row is orders of magnitude slower for this 200k-row dataset.
+        all_task_indices = (
+            self.base.dataset.hf_dataset.data.column("task_index")
+            .combine_chunks()
+            .to_numpy(zero_copy_only=False)
+        )
+        selected_task_indices = all_task_indices[np.asarray(self.base.indices)]
+        self.objective_ids = [index_to_objective[int(i)] for i in selected_task_indices]
+
+        # Each instruction variant must map to the same semantic 5 x 3 space.
+        if set(index_to_objective.values()) != set(range(NUM_OBJECTIVES)):
+            raise ValueError("LeRobot task table does not cover all 15 object/target objectives")
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, index):
+        row = self.base[index]
+        task = row.pop("task")
+        objective_id = self.objective_ids[index]
+        if objective_id_from_task(task) != objective_id:
+            raise ValueError("Cached objective does not match the row instruction")
+        task_one_hot = torch.zeros(NUM_OBJECTIVES, dtype=row["observation.state"].dtype)
+        task_one_hot[objective_id] = 1
+        row["observation.state"] = torch.cat((row["observation.state"], task_one_hot))
+        return row
+
+    def stats(self):
+        stats = self.base.stats()
+        objective_ids = torch.tensor(self.objective_ids, dtype=torch.long)
+        objective_vectors = torch.nn.functional.one_hot(
+            objective_ids, num_classes=NUM_OBJECTIVES
+        ).float()
+        task_mean = objective_vectors.mean(0)
+        task_std = objective_vectors.std(0, unbiased=False).clamp_min(1e-6)
+        state_stats = stats["observation.state"]
+        state_stats["mean"] = torch.cat((state_stats["mean"], task_mean))
+        state_stats["std"] = torch.cat((state_stats["std"], task_std))
+
+        image_stats = json.loads((self.root / "meta/stats.json").read_text())
+        for key in CAMERAS:
+            stats[key] = {
+                name: torch.tensor(image_stats[key][name], dtype=torch.float32)
+                for name in ("mean", "std")
+            }
+        return stats
+
+    def contract(self):
+        return {
+            **self.base.contract(),
+            "policy_family": "act",
+            "task_conditioning": {
+                "representation": "15_way_object_target_one_hot_appended_to_observation.state",
+                "object_order": list(OBJECT_COLORS),
+                "target_order": list(TARGET_COLORS),
+                "robot_state_dimensions": 6,
+                "task_dimensions": NUM_OBJECTIVES,
+                "total_state_dimensions": 6 + NUM_OBJECTIVES,
+            },
+        }

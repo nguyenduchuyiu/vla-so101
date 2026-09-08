@@ -5,14 +5,16 @@ one per (source cube, place target) pair, all run from the same initial state S0
 Per control step we store rendered images, the proprio row (deg + gripper %), the
 phase derived from the oracle's current stage, and a full physics snapshot
 (qpos/qvel/ctrl) so build.py can restore the exact state for counterfactual
-rollout. Only successful episodes are kept; a scene is dropped entirely if any of
-its (source,target) episodes fails, so the objectives stay balanced per scene.
+rollout. Only the individual unsuccessful (source, target) episode is dropped;
+other successful episodes from the same scene are retained.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import os
 import shutil
 import signal
 from pathlib import Path
@@ -91,7 +93,10 @@ def _collect_objective(env, oracle, max_steps: int) -> tuple[list[dict], dict, b
     obs = env._get_obs()  # render at the restored initial state (t=0)
     info: dict = {}
     steps = 0
-    while not oracle.finished and steps < max_steps:
+    settle_steps = 0
+    # Keep applying the final held target after the scripted stages finish so
+    # the PD controller can settle and the environment can emit terminal.
+    while steps < max_steps:
         action, stage = oracle.select_action()
         frames.append(
             {
@@ -109,6 +114,10 @@ def _collect_objective(env, oracle, max_steps: int) -> tuple[list[dict], dict, b
         steps += 1
         if terminated or truncated:
             break
+        if stage == "finished":
+            settle_steps += 1
+            if settle_steps >= 20:
+                break
     success = bool(info.get("success", False)) and not bool(info.get("is_grasped", False))
     return frames, info, success
 
@@ -132,6 +141,91 @@ def _save_episode(out: Path, episode_index: int, frames: list[dict]) -> str:
     return f"episodes/{filename}"
 
 
+def _collect_scene_worker(
+    staging_root: str,
+    scene_index: int,
+    seed: int,
+    width: int,
+    height: int,
+    robot_noise: float,
+) -> dict:
+    """Collect one scene in an isolated process and write its images locally."""
+    scene_out = Path(staging_root) / f"scene-{scene_index:06d}"
+    (scene_out / "episodes").mkdir(parents=True)
+    scene_id = f"scene_{seed:06d}"
+    initial_state_id = f"init_{seed:06d}"
+    env = make_env(width, height, source_index=0, robot_init_qpos_noise=robot_noise)
+    episodes = []
+    failures = []
+    try:
+        env.reset(seed=seed)
+        s0 = save_snapshot(env)
+        for source_id in range(NUM_OBJECTIVES):
+            for target_id in range(NUM_TARGETS):
+                restore_snapshot(env, s0)
+                env.set_objective(source_id, target_id)
+                ep_id = f"{scene_id}_s{source_id}_t{target_id}"
+                try:
+                    oracle = Oracle(ENV_ID, env)
+                    max_steps = sum(stage.steps for stage in oracle.stages) + 20
+                    frames, rollout_info, success = _collect_objective(env, oracle, max_steps)
+                except (RuntimeError, ValueError) as exc:
+                    failures.append(
+                        {
+                            "scene_id": scene_id,
+                            "source_id": source_id,
+                            "target_id": target_id,
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                if not success or len(frames) < 8:
+                    failures.append(
+                        {
+                            "scene_id": scene_id,
+                            "source_id": source_id,
+                            "target_id": target_id,
+                            "success": success,
+                            "num_frames": len(frames),
+                        }
+                    )
+                    continue
+                local_index = source_id * NUM_TARGETS + target_id
+                rel = _save_episode(scene_out, local_index, frames)
+                episodes.append(
+                    {
+                        "temporary_path": str(scene_out / rel),
+                        "meta": {
+                            "scene_id": scene_id,
+                            "scene_seed": seed,
+                            "initial_state_id": initial_state_id,
+                            "scene_index": scene_index,
+                            "episode_id": ep_id,
+                            "objective_id": source_id,
+                            "source_id": source_id,
+                            "objective_color": OBJECTIVE_COLORS[source_id],
+                            "target_id": target_id,
+                            "target_color": TARGET_COLORS[target_id],
+                            "instruction": instruction(source_id, target_id, variant_for(ep_id)),
+                            "is_counterfactual": False,
+                            "success": success,
+                            "num_frames": len(frames),
+                            "final_obj_to_target_dist": float(
+                                rollout_info.get("obj_to_target_dist", float("nan"))
+                            ),
+                        },
+                    }
+                )
+    finally:
+        env.close()
+    return {
+        "scene_index": scene_index,
+        "scene_id": scene_id,
+        "episodes": episodes,
+        "failures": failures,
+    }
+
+
 def collect(args: argparse.Namespace) -> Path:
     out = args.out.resolve()
     if out.exists():
@@ -140,83 +234,56 @@ def collect(args: argparse.Namespace) -> Path:
         shutil.rmtree(out)
     (out / "episodes").mkdir(parents=True)
     (out / "meta").mkdir()
+    staging_root = out / ".collect_shards"
+    staging_root.mkdir()
 
     records: list[dict] = []
     failures: list[dict] = []
     episode_index = 0
     width, height = args.width, args.height
-    env = make_env(width, height, source_index=0, robot_init_qpos_noise=args.robot_noise)
-
-    for scene_index in range(args.scenes):
-        seed = args.seed + scene_index
-        scene_id = f"scene_{seed:06d}"
-        initial_state_id = f"init_{seed:06d}"
-        env.reset(seed=seed)
-        s0 = save_snapshot(env)
-        # All (source,target) objectives share the same stage plan length; probe (0,0) to size max_steps.
-        env.set_objective(0, 0)
-        max_steps = sum(s.steps for s in Oracle(ENV_ID, env).stages) + 20
-
-        scene_episodes: list[tuple[list[dict], dict]] = []
-        scene_failed = False
-        for source_id, target_id in tqdm(
-            [(s, t) for s in range(NUM_OBJECTIVES) for t in range(NUM_TARGETS)],
-            desc=f"scene {scene_index + 1}/{args.scenes} ({scene_id})", leave=False,
-        ):
-            restore_snapshot(env, s0)
-            env.set_objective(source_id, target_id)
-            oracle = Oracle(ENV_ID, env)
-            ep_id = f"{scene_id}_s{source_id}_t{target_id}"
-            try:
-                frames, info, success = _collect_objective(env, oracle, max_steps)
-            except RuntimeError as exc:
-                failures.append({"scene_id": scene_id, "source_id": source_id, "target_id": target_id, "error": str(exc)})
-                scene_failed = True
-                break
-            if not success or len(frames) < 8:
-                failures.append(
-                    {
-                        "scene_id": scene_id,
-                        "source_id": source_id,
-                        "target_id": target_id,
-                        "success": success,
-                        "num_frames": len(frames),
-                    }
-                )
-                scene_failed = True
-                break
-            scene_episodes.append(
-                (
-                    frames,
-                    {
-                        "scene_id": scene_id,
-                        "initial_state_id": initial_state_id,
-                        "scene_index": scene_index,
-                        "episode_id": ep_id,
-                        "objective_id": source_id,
-                        "source_id": source_id,
-                        "objective_color": OBJECTIVE_COLORS[source_id],
-                        "target_id": target_id,
-                        "target_color": TARGET_COLORS[target_id],
-                        "instruction": instruction(source_id, target_id, variant_for(ep_id)),
-                        "is_counterfactual": False,
-                        "success": success,
-                        "num_frames": len(frames),
-                        "final_obj_to_target_dist": float(info.get("obj_to_target_dist", float("nan"))),
-                    },
+    requested_workers = int(getattr(args, "workers", 1))
+    if requested_workers < 1:
+        raise ValueError("workers must be positive")
+    workers = min(requested_workers, args.scenes)
+    jobs = [
+        (str(staging_root), scene_index, args.seed + scene_index, width, height, args.robot_noise)
+        for scene_index in range(args.scenes)
+    ]
+    if workers == 1:
+        scene_results = [_collect_scene_worker(*job) for job in tqdm(jobs, desc="collect scenes")]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            scene_results = list(
+                tqdm(
+                    executor.map(_collect_scene_worker, *zip(*jobs, strict=True)),
+                    total=len(jobs),
+                    desc=f"collect scenes ({workers} workers)",
                 )
             )
 
-        if scene_failed:
-            continue
-        for frames, meta in scene_episodes:
-            rel = _save_episode(out, episode_index, frames)
+    for result in sorted(scene_results, key=lambda item: item["scene_index"]):
+        failures.extend(result["failures"])
+        for failure in result["failures"]:
+            detail = failure.get(
+                "error",
+                f"success={failure.get('success')} frames={failure.get('num_frames')}",
+            )
+            tqdm.write(
+                f"WARNING {failure['scene_id']} source={failure['source_id']} "
+                f"target={failure['target_id']}: {detail}; dropping this objective only"
+            )
+        for item in result["episodes"]:
+            rel = f"episodes/ep_{episode_index:06d}.npz"
+            shutil.move(item["temporary_path"], out / rel)
+            meta = item["meta"]
             meta.update({"episode_index": episode_index, "file": rel})
             records.append(meta)
             episode_index += 1
-        print(f"scene {scene_index + 1}/{args.scenes} ({scene_id}): saved {NUM_OBJECTIVES * NUM_TARGETS} episodes")
-
-    env.close()
+        print(
+            f"scene {result['scene_index'] + 1}/{args.scenes} ({result['scene_id']}): "
+            f"saved {len(result['episodes'])} episodes, dropped {len(result['failures'])}"
+        )
+    shutil.rmtree(staging_root)
 
     with (out / "meta" / "nominal_episodes.jsonl").open("w", encoding="utf-8") as handle:
         for record in records:
@@ -233,6 +300,7 @@ def collect(args: argparse.Namespace) -> Path:
         "target_colors": list(TARGET_COLORS),
         "num_scenes_requested": args.scenes,
         "num_scenes_saved": len({r["scene_id"] for r in records}),
+        "collection_workers": workers,
         "total_episodes": len(records),
         "total_frames": sum(r["num_frames"] for r in records),
         "image_shape": [height, width, 3],
@@ -263,10 +331,13 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=96)
     parser.add_argument("--height", type=int, default=96)
     parser.add_argument("--robot-noise", type=float, default=0.02)
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.scenes <= 0:
         raise ValueError("--scenes must be positive")
+    if args.workers <= 0:
+        raise ValueError("--workers must be positive")
     signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("collect timed out")))
     # 15 episodes/scene (NUM_OBJECTIVES x NUM_TARGETS) at 256x256 render; the old
     # 150*scenes constant predates the 3x episode bump and timed out. ~30s/episode.

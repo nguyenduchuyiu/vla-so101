@@ -1,11 +1,13 @@
-"""Fine-tune LeRobot SmolVLA on exported CF delta-joint chunks."""
+"""Fine-tune LeRobot SmolVLA on full 30 Hz CF trajectory chunks."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import random
+import re
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +27,11 @@ def main():
     parser.add_argument("--data", type=Path, default=Path("data/lerobot_cf"))
     parser.add_argument("--output", type=Path, default=Path("runs/smolvla_cf"))
     parser.add_argument("--pretrained", default="lerobot/smolvla_base")
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        help="Resume from checkpoint-NNNNNN. --steps remains the final global step.",
+    )
     parser.add_argument("--split", choices=["train", "all"], default="train")
     parser.add_argument("--device", choices=["cuda", "mps", "cpu"], default="cuda")
     parser.add_argument("--steps", type=int, default=10000)
@@ -49,14 +56,42 @@ def main():
         raise ValueError("execute-steps must be between 1 and chunk-size")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA unavailable; use --device mps on Apple Silicon")
+    if args.resume_from is not None and not args.resume_from.is_dir():
+        raise FileNotFoundError(f"Resume checkpoint does not exist: {args.resume_from}")
     if args.output.exists():
         raise FileExistsError(f"Choose a fresh output directory: {args.output}")
+
+    start_step = 0
+    training_state = None
+    if args.resume_from is not None:
+        state_path = args.resume_from / "training_state.pt"
+        if state_path.exists():
+            training_state = torch.load(state_path, map_location="cpu", weights_only=False)
+            start_step = int(training_state["step"])
+        else:
+            match = re.fullmatch(r"checkpoint-(\d+)", args.resume_from.name)
+            if match is None:
+                raise ValueError(
+                    "A legacy checkpoint without training_state.pt must be named checkpoint-NNNNNN"
+                )
+            start_step = int(match.group(1))
+            warnings.warn(
+                "Legacy checkpoint has no optimizer state: model weights and the global LR schedule "
+                "will resume, but Adam moments restart from zero.",
+                stacklevel=1,
+            )
+        if start_step >= args.steps:
+            raise ValueError(
+                f"Checkpoint is at step {start_step}, which must be below target --steps {args.steps}"
+            )
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     dataset = LeRobotCFDataset(args.data, args.chunk_size, args.split)
     stats = dataset.stats()
-    config = SmolVLAConfig.from_pretrained(args.pretrained)
+    model_source = args.resume_from if args.resume_from is not None else args.pretrained
+    config = SmolVLAConfig.from_pretrained(model_source)
     config.device = args.device
     config.push_to_hub = False
     config.load_vlm_weights = False  # The complete policy checkpoint supplies all weights.
@@ -78,7 +113,7 @@ def main():
     config.output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(6,))}
     # Keep the pretrained 32D internal projections. LeRobot pads inputs and slices
     # predictions/loss to the six real SO101 channels.
-    policy = SmolVLAPolicy.from_pretrained(args.pretrained, config=config, strict=True).to(args.device)
+    policy = SmolVLAPolicy.from_pretrained(model_source, config=config, strict=True).to(args.device)
     preprocessor, postprocessor = make_smolvla_pre_post_processors(config, stats)
     optimizer = torch.optim.AdamW(
         [p for p in policy.parameters() if p.requires_grad], lr=args.lr,
@@ -86,6 +121,25 @@ def main():
         weight_decay=config.optimizer_weight_decay,
     )
     scheduler = config.get_scheduler_preset().build(optimizer, args.steps)
+    if training_state is not None:
+        optimizer.load_state_dict(training_state["optimizer"])
+        scheduler.load_state_dict(training_state["scheduler"])
+        random.setstate(training_state["python_random_state"])
+        np.random.set_state(training_state["numpy_random_state"])
+        torch.set_rng_state(training_state["torch_rng_state"])
+        if args.device == "cuda" and training_state.get("cuda_rng_state_all") is not None:
+            torch.cuda.set_rng_state_all(training_state["cuda_rng_state_all"])
+        print(f"Resumed complete training state at global step {start_step}", flush=True)
+    elif start_step:
+        # Position the newly-created scheduler on the original global timeline.
+        # At the beginning of global step N+1, its state must correspond to N.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            scheduler.step(start_step)
+        print(
+            f"Resumed model at global step {start_step}; optimizer moments were unavailable and reset",
+            flush=True,
+        )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
     args.output.mkdir(parents=True)
     contract = dataset.contract()
@@ -97,7 +151,7 @@ def main():
     started = time.monotonic()
     policy.train()
     with (args.output / "metrics.jsonl").open("w") as log:
-        for step in range(1, args.steps + 1):
+        for step in range(start_step + 1, args.steps + 1):
             try:
                 raw_batch = next(batches)
             except StopIteration:
@@ -130,6 +184,22 @@ def main():
                 preprocessor.save_pretrained(checkpoint)
                 postprocessor.save_pretrained(checkpoint)
                 (checkpoint / "so101_contract.json").write_text(json.dumps(contract, indent=2) + "\n")
+                state_tmp = checkpoint / "training_state.pt.tmp"
+                torch.save(
+                    {
+                        "step": step,
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "python_random_state": random.getstate(),
+                        "numpy_random_state": np.random.get_state(),
+                        "torch_rng_state": torch.get_rng_state(),
+                        "cuda_rng_state_all": torch.cuda.get_rng_state_all()
+                        if args.device == "cuda"
+                        else None,
+                    },
+                    state_tmp,
+                )
+                state_tmp.replace(checkpoint / "training_state.pt")
                 print(f"Saved {checkpoint}", flush=True)
 
 

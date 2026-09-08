@@ -3,9 +3,10 @@
 Reads the Stage-A nominal dataset (episodes/*.npz + meta/nominal_episodes.jsonl) and
 emits, into the same directory:
 
-  * cf_anchors/an_<anchor_id>.npz  -- per anchor, expert command chunks for every
-    branch (NUM_OBJECTIVES for a REACH_PICK source-CF group, NUM_TARGETS for a
-    REACH_PLACE target-CF group, 1 for a nominal-only anchor).
+  * cf_anchors/an_<anchor_id>.npz  -- per-anchor expert command prefixes.
+  * cf_trajectories/tr_<branch_id>.npz -- every real CF observation/action from
+    the shared anchor through terminal; nominal branches reference their recorded
+    episode suffix without duplicating it.
   * meta/anchors.jsonl            -- one line per anchor (output C, the balanced
     training set; each line lists its branches).
   * meta/eval_pairs.jsonl          -- REACH_PICK + REACH_PLACE counterfactual groups
@@ -40,7 +41,10 @@ branches = 4*N_rp (one per phase group); CF branches = (NUM_OBJECTIVES-1)*N_rp +
 from __future__ import annotations
 
 import argparse
+import atexit
+import concurrent.futures
 import json
+import os
 import shutil
 import signal
 from pathlib import Path
@@ -48,7 +52,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from cf_data.collect import make_env
+from cf_data.collect import CONTROL_DT, make_env
 from cf_data.core import (
     GRASP,
     NUM_OBJECTIVES,
@@ -71,6 +75,14 @@ from cf_data.env import ENV_ID
 from cf_data.oracle import Oracle
 
 PHASE_POOLS = (REACH_PICK, GRASP, REACH_PLACE, PLACE)
+
+
+def _prepare_scene(env, meta: dict) -> None:
+    """Restore scene-level model state (notably fixed target body positions)."""
+    seed = int(meta.get("scene_seed", str(meta["scene_id"]).rsplit("_", 1)[-1]))
+    if getattr(env, "_cf_prepared_scene_seed", None) != seed:
+        env.reset(seed=seed)
+        env._cf_prepared_scene_seed = seed
 
 
 def _load_nominal(in_dir: Path) -> list[dict]:
@@ -125,11 +137,25 @@ def _cf_valid(env, snap: Snapshot, source_id: int, target_id: int,
     return True
 
 
-def _roll_cf(env, snap: Snapshot, source_id: int, target_id: int, horizon: int) -> np.ndarray:
+def _start_oracle_at_phase(oracle: Oracle, phase: int) -> None:
+    if phase == REACH_PICK:
+        return
+    for index, stage in enumerate(oracle.stages):
+        if stage_to_phase(stage.name) == phase:
+            oracle.stage_index = index
+            oracle.stage_step = 0
+            return
+    raise ValueError(f"oracle has no stage for phase {phase}")
+
+
+def _roll_cf(
+    env, snap: Snapshot, source_id: int, target_id: int, horizon: int, start_phase: int = REACH_PICK
+) -> np.ndarray:
     """Roll a fresh oracle and retain its actual absolute joint-position commands."""
     restore_snapshot(env, snap)
     env.set_objective(source_id, target_id)
     oracle = Oracle(ENV_ID, env)
+    _start_oracle_at_phase(oracle, start_phase)
     chunk: list[np.ndarray] = []
     while len(chunk) < horizon:
         if oracle.finished:
@@ -142,6 +168,73 @@ def _roll_cf(env, snap: Snapshot, source_id: int, target_id: int, horizon: int) 
     while len(chunk) < horizon:
         chunk.append(chunk[-1].copy())
     return np.stack(chunk).astype(np.float32)
+
+
+def _roll_cf_trajectory(
+    env, snap: Snapshot, source_id: int, target_id: int, start_phase: int = REACH_PICK
+) -> tuple[dict[str, np.ndarray], dict]:
+    """Roll one CF branch to completion and retain every observation and command.
+
+    Frames follow the collector convention: observation/state are recorded just
+    before ``action[t]`` is applied.  Unlike ``_roll_cf`` this deliberately uses
+    ``env.step`` so cameras and task termination are available.
+    """
+    restore_snapshot(env, snap)
+    env.set_objective(source_id, target_id)
+    oracle = Oracle(ENV_ID, env)
+    _start_oracle_at_phase(oracle, start_phase)
+    max_steps = sum(stage.steps for stage in oracle.stages[oracle.stage_index :]) + 20
+    obs = env._get_obs()
+    frames: list[dict] = []
+    info: dict = {}
+    terminated = truncated = False
+    settle_steps = 0
+    # Continue holding the final target after the plan finishes. Success also
+    # requires the robot to settle, which can take several control steps.
+    while len(frames) < max_steps:
+        action, stage = oracle.select_action()
+        frame = {
+            "overhead": obs["overhead_camera"].copy(),
+            "wrist": obs["wrist_camera"].copy(),
+            "state": qpos_to_row(env._get_current_qpos()),
+            "action": qpos_to_row(action),
+            "phase": stage_to_phase(stage),
+            "terminal": False,
+        }
+        obs, _, terminated, truncated, info = env.step(action)
+        frame["terminal"] = bool(terminated or truncated)
+        frames.append(frame)
+        if terminated or truncated:
+            break
+        if stage == "finished":
+            settle_steps += 1
+            if settle_steps >= 20:
+                break
+    if not frames:
+        raise RuntimeError("counterfactual rollout produced no frames")
+    if oracle.finished:
+        frames[-1]["terminal"] = True
+    success = bool(info.get("success", False)) and not bool(info.get("is_grasped", False))
+    if not success:
+        diagnostics = {
+            key: info.get(key)
+            for key in ("is_obj_placed", "is_grasped", "is_robot_static", "obj_to_target_dist")
+        }
+        raise RuntimeError(
+            f"counterfactual rollout did not succeed after {len(frames)} steps "
+            f"(terminated={terminated}, truncated={truncated}, diagnostics={diagnostics})"
+        )
+    frames[-1]["terminal"] = True
+    arrays = {
+        "observation.state": np.stack([f["state"] for f in frames]).astype(np.float32),
+        "observation.images.overhead": np.stack([f["overhead"] for f in frames]),
+        "observation.images.wrist": np.stack([f["wrist"] for f in frames]),
+        "action": np.stack([f["action"] for f in frames]).astype(np.float32),
+        "phase": np.asarray([f["phase"] for f in frames], dtype=np.int8),
+        "terminal": np.asarray([f["terminal"] for f in frames], dtype=bool),
+        "timestamp": (np.arange(len(frames)) * CONTROL_DT).astype(np.float32),
+    }
+    return arrays, info
 
 
 def _scan_anchors(episodes: list[dict], anchor_stride: int) -> dict[int, list[tuple[int, int, int]]]:
@@ -183,6 +276,7 @@ def _filter_rp(
     valid: list[tuple[int, int, int]] = []
     for ep_idx, t, obj_id in tqdm(rp_candidates, desc="filter REACH_PICK", leave=False):
         ep = episodes[ep_idx]
+        _prepare_scene(env, ep["meta"])
         tgt = ep["meta"]["target_id"]
         snap = Snapshot(ep["snap_qpos"][t], ep["snap_qvel"][t], ep["snap_ctrl"][t])
         if all(_cf_valid(env, snap, j, tgt, obj_id, tgt) for j in range(num_objectives)):
@@ -198,6 +292,7 @@ def _filter_place(
     valid: list[tuple[int, int, int]] = []
     for ep_idx, t, obj_id in tqdm(place_candidates, desc="filter REACH_PLACE", leave=False):
         ep = episodes[ep_idx]
+        _prepare_scene(env, ep["meta"])
         src = ep["meta"]["objective_id"]
         tgt = ep["meta"]["target_id"]
         snap = Snapshot(ep["snap_qpos"][t], ep["snap_qvel"][t], ep["snap_ctrl"][t])
@@ -237,7 +332,13 @@ def _build_rp_group(
     branches: list[dict] = []
     for j in range(num_objectives):
         is_cf = j != obj_id
-        future = _roll_cf(env, snap, j, tgt, horizon) if is_cf else _future_from_nominal(ep, t, horizon)
+        try:
+            future = _roll_cf(env, snap, j, tgt, horizon) if is_cf else _future_from_nominal(ep, t, horizon)
+        except (RuntimeError, ValueError) as exc:
+            tqdm.write(
+                f"WARNING {anchor_id} source={j} target={tgt}: {exc}; dropping this branch only"
+            )
+            continue
         futures.append(future)
         src_ids.append(j)
         tgt_ids.append(tgt)
@@ -289,7 +390,17 @@ def _build_place_group(
     branches: list[dict] = []
     for k in range(num_targets):
         is_cf = k != tgt
-        future = _roll_cf(env, snap, src, k, horizon) if is_cf else _future_from_nominal(ep, t, horizon)
+        try:
+            future = (
+                _roll_cf(env, snap, src, k, horizon, start_phase=REACH_PLACE)
+                if is_cf
+                else _future_from_nominal(ep, t, horizon)
+            )
+        except (RuntimeError, ValueError) as exc:
+            tqdm.write(
+                f"WARNING {anchor_id} source={src} target={k}: {exc}; dropping this branch only"
+            )
+            continue
         futures.append(future)
         src_ids.append(src)
         tgt_ids.append(k)
@@ -345,16 +456,178 @@ def _build_nominal_branch(
     )
 
 
+_BUILD_WORKER_EPISODES: list[dict] | None = None
+_BUILD_WORKER_ENV = None
+_BUILD_WORKER_IN_DIR: Path | None = None
+
+
+def _init_build_worker(in_dir: str, width: int, height: int) -> None:
+    """Give each process its own MuJoCo model/data and EGL rendering context."""
+    global _BUILD_WORKER_EPISODES, _BUILD_WORKER_ENV, _BUILD_WORKER_IN_DIR
+    _BUILD_WORKER_IN_DIR = Path(in_dir)
+    _BUILD_WORKER_EPISODES = _load_nominal(_BUILD_WORKER_IN_DIR)
+    _BUILD_WORKER_ENV = make_env(width, height, source_index=0, robot_init_qpos_noise=0.0)
+    atexit.register(_BUILD_WORKER_ENV.close)
+
+
+def _filter_candidate_worker(payload: tuple[int, tuple[int, int, int], int]):
+    phase, candidate, branch_count = payload
+    ep_idx, t, obj_id = candidate
+    episodes = _BUILD_WORKER_EPISODES
+    env = _BUILD_WORKER_ENV
+    if episodes is None or env is None:
+        raise RuntimeError("build worker was not initialized")
+    ep = episodes[ep_idx]
+    _prepare_scene(env, ep["meta"])
+    src = int(ep["meta"]["objective_id"])
+    tgt = int(ep["meta"]["target_id"])
+    snap = Snapshot(ep["snap_qpos"][t], ep["snap_qvel"][t], ep["snap_ctrl"][t])
+    if phase == REACH_PICK:
+        valid = all(_cf_valid(env, snap, j, tgt, obj_id, tgt) for j in range(branch_count))
+    elif phase == REACH_PLACE:
+        valid = all(_cf_valid(env, snap, src, k, src, tgt) for k in range(branch_count))
+    else:
+        raise ValueError(f"cannot CF-filter phase {phase}")
+    return candidate if valid else None
+
+
+def _emit_anchor_core(
+    env,
+    episodes: list[dict],
+    in_dir: Path,
+    phase: int,
+    ep_idx: int,
+    t: int,
+    horizon: int,
+    num_objectives: int,
+    num_targets: int,
+    scene_rank: dict[int, int],
+    n_scenes: int,
+) -> dict:
+    ep = episodes[ep_idx]
+    meta = ep["meta"]
+    _prepare_scene(env, meta)
+    anchor_id = _anchor_id(meta["episode_id"], t)
+    if phase == REACH_PICK:
+        future_chunks, obj_ids, tgt_ids, cf_flags, branches = _build_rp_group(
+            env, episodes, ep_idx, t, horizon, num_objectives
+        )
+    elif phase == REACH_PLACE:
+        future_chunks, obj_ids, tgt_ids, cf_flags, branches = _build_place_group(
+            env, episodes, ep_idx, t, horizon, num_targets
+        )
+    else:
+        future_chunks, obj_ids, tgt_ids, cf_flags, branches = _build_nominal_branch(
+            episodes, ep_idx, t, horizon
+        )
+
+    anchor_proprio = ep["state"][t].astype(np.float32)
+    kept = []
+    failures = []
+    snap = Snapshot(ep["snap_qpos"][t], ep["snap_qvel"][t], ep["snap_ctrl"][t])
+    for branch_index, branch in enumerate(branches):
+        if not branch["is_counterfactual"]:
+            branch["trajectory_kind"] = "nominal_suffix"
+            branch["trajectory_path"] = meta["file"]
+            branch["trajectory_start_frame"] = t
+            kept.append(branch_index)
+            continue
+        try:
+            trajectory, rollout_info = _roll_cf_trajectory(
+                env,
+                snap,
+                int(branch["source_id"]),
+                int(branch["target_id"]),
+                start_phase=phase,
+            )
+            prefix = trajectory["action"][:horizon]
+            expected = future_chunks[branch_index, : len(prefix)]
+            if not np.allclose(prefix, expected, atol=1e-4, rtol=1e-5):
+                raise RuntimeError("full CF rollout differs from validated action prefix")
+            rel = f"cf_trajectories/tr_{branch['branch_id']}.npz"
+            np.savez_compressed(in_dir / rel, **trajectory)
+            branch["trajectory_kind"] = "counterfactual"
+            branch["trajectory_path"] = rel
+            branch["trajectory_start_frame"] = 0
+            branch["num_frames"] = int(len(trajectory["action"]))
+            branch["success"] = True
+            branch["final_obj_to_target_dist"] = float(
+                rollout_info.get("obj_to_target_dist", float("nan"))
+            )
+            kept.append(branch_index)
+        except (RuntimeError, ValueError) as exc:
+            failures.append(
+                {
+                    "anchor_id": anchor_id,
+                    "branch_id": branch["branch_id"],
+                    "source_id": int(branch["source_id"]),
+                    "target_id": int(branch["target_id"]),
+                    "error": str(exc),
+                }
+            )
+
+    future_chunks = future_chunks[kept]
+    obj_ids = obj_ids[kept]
+    tgt_ids = tgt_ids[kept]
+    cf_flags = cf_flags[kept]
+    branches = [branches[index] for index in kept]
+    np.savez_compressed(
+        in_dir / "cf_anchors" / f"an_{anchor_id}.npz",
+        future_chunks=future_chunks,
+        objective_ids=obj_ids,
+        target_ids=tgt_ids,
+        is_counterfactual=cf_flags,
+        anchor_proprio=anchor_proprio,
+    )
+    split = split_for_scene(scene_rank[int(meta["scene_index"])], n_scenes)
+    record = {
+        "anchor_id": anchor_id,
+        "scene_id": meta["scene_id"],
+        "scene_index": meta["scene_index"],
+        "episode_id": meta["episode_id"],
+        "nominal_episode_path": meta["file"],
+        "anchor_frame": t,
+        "phase": int(phase),
+        "phase_name": ("REACH_PICK", "GRASP", "REACH_PLACE", "PLACE")[phase],
+        "split": split,
+        "horizon": horizon,
+        "n_branches": int(len(branches)),
+        "cf_path": f"cf_anchors/an_{anchor_id}.npz",
+        "branches": branches,
+    }
+    return {
+        "record": record,
+        "objective_ids": obj_ids.tolist(),
+        "target_ids": tgt_ids.tolist(),
+        "cf_flags": cf_flags.tolist(),
+        "failures": failures,
+    }
+
+
+def _emit_anchor_worker(payload: tuple) -> dict:
+    if _BUILD_WORKER_EPISODES is None or _BUILD_WORKER_ENV is None or _BUILD_WORKER_IN_DIR is None:
+        raise RuntimeError("build worker was not initialized")
+    return _emit_anchor_core(
+        _BUILD_WORKER_ENV,
+        _BUILD_WORKER_EPISODES,
+        _BUILD_WORKER_IN_DIR,
+        *payload,
+    )
+
+
 def build(args: argparse.Namespace) -> Path:
     in_dir: Path = args.in_dir.resolve()
     if not (in_dir / "meta" / "nominal_episodes.jsonl").exists():
         raise FileNotFoundError(f"{in_dir / 'meta' / 'nominal_episodes.jsonl'} missing")
     cf_anchors = in_dir / "cf_anchors"
-    if cf_anchors.exists():
-        if not args.overwrite:
-            raise FileExistsError(f"{cf_anchors} exists; pass --overwrite")
-        shutil.rmtree(cf_anchors)
+    cf_trajectories = in_dir / "cf_trajectories"
+    existing_outputs = [path for path in (cf_anchors, cf_trajectories) if path.exists()]
+    if existing_outputs and not args.overwrite:
+        raise FileExistsError(f"{existing_outputs[0]} exists; pass --overwrite")
+    for path in existing_outputs:
+        shutil.rmtree(path)
     cf_anchors.mkdir()
+    cf_trajectories.mkdir()
 
     info = json.loads((in_dir / "meta" / "info.json").read_text())
     info["action_semantics"] = "pd_joint_pos_command_recoverable_from_snapshot_ctrl"
@@ -365,13 +638,53 @@ def build(args: argparse.Namespace) -> Path:
     num_objectives = info["num_objectives"]
     num_targets = info["num_targets"]
     episodes = _load_nominal(in_dir)
-    n_scenes = info["num_scenes_saved"]
-
-    env = make_env(width, height, source_index=0, robot_init_qpos_noise=0.0)
+    if not episodes:
+        raise ValueError("No successful nominal episodes to build")
+    scene_indices = sorted({int(ep["meta"]["scene_index"]) for ep in episodes})
+    scene_rank = {scene_index: rank for rank, scene_index in enumerate(scene_indices)}
+    n_scenes = len(scene_indices)
 
     pools = _scan_anchors(episodes, args.anchor_stride)
-    valid_rp = _filter_rp(env, episodes, pools[REACH_PICK], num_objectives)
-    valid_place = _filter_place(env, episodes, pools[REACH_PLACE], num_targets)
+    requested_workers = int(getattr(args, "workers", 1))
+    if requested_workers < 1:
+        raise ValueError("workers must be positive")
+    workers = min(requested_workers, max(1, len(pools[REACH_PICK])))
+    executor = None
+    env = None
+    if workers == 1:
+        env = make_env(width, height, source_index=0, robot_init_qpos_noise=0.0)
+        valid_rp = _filter_rp(env, episodes, pools[REACH_PICK], num_objectives)
+        valid_place = _filter_place(env, episodes, pools[REACH_PLACE], num_targets)
+    else:
+        executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_build_worker,
+            initargs=(str(in_dir), width, height),
+        )
+        rp_payloads = [(REACH_PICK, candidate, num_objectives) for candidate in pools[REACH_PICK]]
+        place_payloads = [
+            (REACH_PLACE, candidate, num_targets) for candidate in pools[REACH_PLACE]
+        ]
+        valid_rp = [
+            candidate
+            for candidate in tqdm(
+                executor.map(_filter_candidate_worker, rp_payloads, chunksize=8),
+                total=len(rp_payloads),
+                desc=f"filter REACH_PICK ({workers} workers)",
+                leave=False,
+            )
+            if candidate is not None
+        ]
+        valid_place = [
+            candidate
+            for candidate in tqdm(
+                executor.map(_filter_candidate_worker, place_payloads, chunksize=8),
+                total=len(place_payloads),
+                desc=f"filter REACH_PLACE ({workers} workers)",
+                leave=False,
+            )
+            if candidate is not None
+        ]
     phase_counts = {
         "REACH_PICK": len(valid_rp),
         "GRASP": len(pools[GRASP]),
@@ -399,72 +712,74 @@ def build(args: argparse.Namespace) -> Path:
     rejected_rp = len(pools[REACH_PICK]) - len(valid_rp)
     rejected_place = len(pools[REACH_PLACE]) - len(valid_place)
     traj_lengths = [int(ep["meta"]["num_frames"]) for ep in episodes]
+    rollout_failures: list[dict] = []
 
-    def _emit(phase: int, ep_idx: int, t: int) -> None:
-        ep = episodes[ep_idx]
-        meta = ep["meta"]
-        anchor_id = _anchor_id(meta["episode_id"], t)
-        if phase == REACH_PICK:
-            future_chunks, obj_ids, tgt_ids, cf_flags, branches = _build_rp_group(
-                env, episodes, ep_idx, t, args.horizon, num_objectives
-            )
-        elif phase == REACH_PLACE:
-            future_chunks, obj_ids, tgt_ids, cf_flags, branches = _build_place_group(
-                env, episodes, ep_idx, t, args.horizon, num_targets
-            )
-        else:
-            future_chunks, obj_ids, tgt_ids, cf_flags, branches = _build_nominal_branch(
-                episodes, ep_idx, t, args.horizon
-            )
-        anchor_proprio = ep["state"][t].astype(np.float32)
-        np.savez_compressed(
-            cf_anchors / f"an_{anchor_id}.npz",
-            future_chunks=future_chunks,
-            objective_ids=obj_ids,
-            target_ids=tgt_ids,
-            is_counterfactual=cf_flags,
-            anchor_proprio=anchor_proprio,
+    emit_payloads = [
+        (
+            phase,
+            ep_idx,
+            t,
+            args.horizon,
+            num_objectives,
+            num_targets,
+            scene_rank,
+            n_scenes,
         )
-        split = split_for_scene(meta["scene_index"], n_scenes)
-        record = {
-            "anchor_id": anchor_id,
-            "scene_id": meta["scene_id"],
-            "scene_index": meta["scene_index"],
-            "episode_id": meta["episode_id"],
-            "nominal_episode_path": meta["file"],
-            "anchor_frame": t,
-            "phase": int(phase),
-            "phase_name": ("REACH_PICK", "GRASP", "REACH_PLACE", "PLACE")[phase],
-            "split": split,
-            "horizon": args.horizon,
-            "n_branches": int(len(branches)),
-            "cf_path": f"cf_anchors/an_{anchor_id}.npz",
-            "branches": branches,
-        }
+        for phase in PHASE_POOLS
+        for ep_idx, t, _obj in sampled[phase]
+    ]
+    if executor is None:
+        emit_results = [
+            _emit_anchor_core(env, episodes, in_dir, *payload)
+            for payload in tqdm(emit_payloads, desc="build anchors")
+        ]
+    else:
+        try:
+            emit_results = list(
+                tqdm(
+                    executor.map(_emit_anchor_worker, emit_payloads, chunksize=1),
+                    total=len(emit_payloads),
+                    desc=f"build anchors ({workers} workers)",
+                )
+            )
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    for result in emit_results:
+        record = result["record"]
+        obj_ids = result["objective_ids"]
+        tgt_ids = result["target_ids"]
+        cf_flags = result["cf_flags"]
+        for failure in result["failures"]:
+            rollout_failures.append(failure)
+            tqdm.write(
+                f"WARNING {failure['branch_id']}: {failure['error']}; dropping this branch only"
+            )
         anchor_records.append(record)
         counts["anchors"] += 1
-        counts["branches"] += len(branches)
+        counts["branches"] += len(record["branches"])
         for j, k, is_cf in zip(obj_ids, tgt_ids, cf_flags):
             counts["cf_branches" if is_cf else "nominal_branches"] += 1
             samples_per_objective[int(j)] += 1
             samples_per_target[int(k)] += 1
-        samples_per_phase[phase] += len(branches)
+        samples_per_phase[record["phase"]] += len(record["branches"])
         # Both REACH_PICK (source-CF) and REACH_PLACE (target-CF) are shared-image
         # groups with differing instructions -- both belong in the eval set.
-        if split == "test" and phase in (REACH_PICK, REACH_PLACE):
+        if record["split"] == "test" and record["phase"] in (REACH_PICK, REACH_PLACE):
             eval_records.append(record)
-
-    for phase in PHASE_POOLS:
-        for ep_idx, t, _obj in sampled[phase]:
-            _emit(phase, ep_idx, t)
-
-    env.close()
+    if env is not None:
+        env.close()
 
     (in_dir / "meta" / "anchors.jsonl").write_text(
         "\n".join(json.dumps(r, ensure_ascii=False) for r in anchor_records) + "\n", encoding="utf-8"
     )
     (in_dir / "meta" / "eval_pairs.jsonl").write_text(
         "\n".join(json.dumps(r, ensure_ascii=False) for r in eval_records) + "\n", encoding="utf-8"
+    )
+    (in_dir / "meta" / "cf_rollout_failures.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rollout_failures)
+        + ("\n" if rollout_failures else ""),
+        encoding="utf-8",
     )
 
     stats = {
@@ -483,6 +798,7 @@ def build(args: argparse.Namespace) -> Path:
         "num_valid_cf_groups": len(valid_rp),
         "num_valid_place_groups": len(valid_place),
         "num_rejected_anchors": int(rejected_rp + rejected_place),
+        "num_failed_cf_rollouts": len(rollout_failures),
         "n_rp_balanced": int(n_rp),
         "candidate_phase_counts": phase_counts,
         "trajectory_length_distribution": {
@@ -492,10 +808,10 @@ def build(args: argparse.Namespace) -> Path:
         },
         "horizon_stored": args.horizon,
         "anchor_stride": args.anchor_stride,
+        "build_workers": workers,
     }
     (in_dir / "meta" / "stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    # Dataset summary. The SmolVLA adapter reads anchors.jsonl directly and keeps
-    # the same unaugmented observation for every branch of an anchor.
+    # Dataset summary. Each branch now references a full observed trajectory.
     training_meta = {
         "dataset_name": "cf_balanced",
         "data_dir": str(args.in_dir),
@@ -532,14 +848,21 @@ def main() -> None:
     parser.add_argument("--anchor-stride", type=int, default=8, help="stride for REACH_PICK anchor candidates")
     parser.add_argument("--max-anchors", type=int, default=None, help="cap N_rp per phase")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--timeout-seconds", type=int, default=0, help="0 disables the build alarm")
     args = parser.parse_args()
     if args.horizon < 1:
         raise ValueError("--horizon must be positive")
     if args.anchor_stride < 1:
         raise ValueError("--anchor-stride must be positive")
-    signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("build timed out")))
-    signal.alarm(2400)
+    if args.workers < 1:
+        raise ValueError("--workers must be positive")
+    if args.timeout_seconds < 0:
+        raise ValueError("--timeout-seconds must be nonnegative")
+    if args.timeout_seconds:
+        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("build timed out")))
+        signal.alarm(args.timeout_seconds)
     print(f"dataset ready: {build(args)}")
 
 
