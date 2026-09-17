@@ -157,6 +157,8 @@ class LeRobotCFDataset(Dataset):
         if any(row.get("row_index") != i for i, row in enumerate(records)):
             raise ValueError("CF manifest row indices are not contiguous")
         self.indices = [row["row_index"] for row in records if split == "all" or row["split"] == split]
+        self.episode_indices = sorted({row["episode_index"] for row in records
+                                       if split == "all" or row["split"] == split})
         if not self.indices:
             raise ValueError(f"No anchors in split={split!r}; --split all is only for explicit overfit experiments")
         self.dataset = LeRobotDataset(repo_id=self._contract["repo_id"], root=self.root)
@@ -251,7 +253,19 @@ class ACTCFDataset(Dataset):
         state_stats["mean"] = torch.cat((state_stats["mean"], task_mean))
         state_stats["std"] = torch.cat((state_stats["std"], task_std))
 
-        image_stats = json.loads((self.root / "meta/stats.json").read_text())
+        from lerobot.datasets.compute_stats import aggregate_stats
+        from lerobot.datasets.io_utils import load_nested_dataset
+
+        metadata = load_nested_dataset(self.root / "meta/episodes")
+        episode_stats = []
+        for episode_index in self.base.episode_indices:
+            episode = metadata[episode_index]
+            episode_stats.append({
+                key: {name: np.asarray(episode[f"stats/{key}/{name}"])
+                      for name in ("mean", "std", "min", "max", "count")}
+                for key in CAMERAS
+            })
+        image_stats = aggregate_stats(episode_stats)
         for key in CAMERAS:
             stats[key] = {
                 name: torch.tensor(image_stats[key][name], dtype=torch.float32)

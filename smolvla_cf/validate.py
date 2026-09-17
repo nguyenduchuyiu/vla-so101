@@ -21,7 +21,7 @@ def main():
     contract = dataset.contract()
     raw_root = Path(contract["raw_source"])
     info = json.loads((raw_root / "meta/info.json").read_text())
-    anchors = [
+    anchors = [] if contract["num_anchors"] == 0 else [
         json.loads(line)
         for line in (raw_root / "meta/anchors.jsonl").read_text().splitlines()
         if line

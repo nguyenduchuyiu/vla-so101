@@ -148,6 +148,8 @@ def evaluate_episode(
     spline_fps: int = 100,
     output: Path | None = None,
     env=None,
+    layout: dict | None = None,
+    trace: list[dict] | None = None,
 ) -> dict:
     """Run one deterministic closed-loop episode with an already-loaded policy."""
     if max_replans < 1:
@@ -174,6 +176,8 @@ def evaluate_episode(
     command_rows = []
     actual_rows = []
     try:
+        if layout is not None:
+            env.set_layout(layout)
         if env.unwrapped.control_mode != "pd_joint_pos":
             raise ValueError("This delta-to-target adapter requires pd_joint_pos control")
         obs, info = env.reset(seed=seed)
@@ -256,6 +260,14 @@ def evaluate_episode(
                 obs, _, terminated, truncated, info = env.step(command)
                 sim_steps_elapsed += 1
                 actual_rows.append(sim_qpos_to_dataset_row(obs["state"], gripper_limits_rad=limits))
+                if trace is not None:
+                    trace.append({
+                        "step": sim_steps_elapsed,
+                        "state": actual_rows[-1].tolist(),
+                        "command": row.tolist(),
+                        "tcp_to_obj_dist": float(info.get("tcp_to_obj_dist", float("nan"))),
+                        "is_grasped": bool(info.get("is_grasped", False)),
+                    })
                 ever_grasped |= bool(info.get("is_grasped", False))
                 ever_placed |= bool(info.get("is_obj_placed", False))
                 max_lift_height = max(max_lift_height, float(info.get("lift_height", float("-inf"))))
@@ -327,6 +339,8 @@ def main():
     parser.add_argument("--source", type=int, choices=range(5), default=0)
     parser.add_argument("--target", type=int, choices=range(3), default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--layout-file", type=Path, help="Nominal meta/layouts.json")
+    parser.add_argument("--scene-index", type=int, help="Scene in layout-file (0..4 train, 5..6 heldout)")
     parser.add_argument("--max-replans", type=int, default=100)
     parser.add_argument(
         "--execute-steps",
@@ -347,6 +361,15 @@ def main():
     parser.add_argument("--spline-fps", type=int, default=100)
     parser.add_argument("--output", type=Path, default=Path("outputs/smolvla_cf.mp4"))
     args = parser.parse_args()
+    layout = None
+    if (args.layout_file is None) != (args.scene_index is None):
+        raise ValueError("Use --layout-file and --scene-index together")
+    if args.layout_file is not None:
+        layouts = json.loads(args.layout_file.read_text())
+        layout = next((row for row in layouts if row["scene_index"] == args.scene_index), None)
+        if layout is None:
+            raise ValueError("scene-index is absent from layout-file")
+        args.seed = layout["seed"]
     if args.no_temporal_ensemble and args.temporal_ensemble_coeff is not None:
         raise ValueError("Choose either --no-temporal-ensemble or --temporal-ensemble-coeff")
     policy, pre, post, contract = load_checkpoint(args.checkpoint, args.device)
@@ -360,6 +383,7 @@ def main():
         max_replans=args.max_replans, execute_steps=args.execute_steps,
         interpolation=args.interpolation,
         spline_fps=args.spline_fps, output=args.output,
+        layout=layout,
     )
     print(result)
     print(f"Video: {args.output}")

@@ -3,7 +3,8 @@
 Same scene layout (object poses, target poses, robot pose, cameras) is produced
 for every (source, target) objective from a single scene seed, because
 ``_task_reset`` places objects and targets at fixed anchors jittered only by
-``self.np_random`` (seeded once per reset). The collector captures the post-reset
+``self.np_random`` (seeded once per reset). ``set_layout`` instead supplies exact
+object/target XY coordinates without jitter. The collector captures the post-reset
 state once and restores it before running the oracle toward each objective, so
 all nominal trajectories share the same starting state. ``source_index`` selects
 which cube the oracle picks; ``target_index`` selects which target it places on.
@@ -136,9 +137,27 @@ class CFMultiObjectEnv(SO101NexusMuJoCoBaseEnv):
         ]
         self._source_anchors = _source_anchors(len(objects))
         self._target_anchors = _target_anchors(len(self.target_colors))
+        self._layout_jitter = _JITTER
         self._obj_geom_id = self._slots[source_index].geom_id
         self._initial_obj_z = self._slots[source_index].spawn_z
         self._finish_model_setup()
+
+    def set_layout(self, layout: dict) -> None:
+        """Use exact world-XY positions on subsequent resets; retain colour order."""
+        objects = np.asarray(layout["objects_xy"], dtype=float)
+        targets = np.asarray(layout["targets_xy"], dtype=float)
+        if objects.shape != (len(self._slots), 2) or targets.shape != (len(self.target_colors), 2):
+            raise ValueError("Layout must specify XY for every object and target")
+        points = np.concatenate([objects, targets])
+        if not np.isfinite(points).all():
+            raise ValueError("Layout positions must be finite")
+        distances = np.linalg.norm(points[:, None] - points[None], axis=2)
+        np.fill_diagonal(distances, np.inf)
+        if distances.min() < 0.07:
+            raise ValueError("Layout positions must be at least 7 cm apart")
+        self._source_anchors = objects
+        self._target_anchors = targets
+        self._layout_jitter = 0.0
 
     def set_objective(self, source_index: int, target_index: int) -> None:
         """Switch which cube the oracle picks and which target it places on.
@@ -187,14 +206,14 @@ class CFMultiObjectEnv(SO101NexusMuJoCoBaseEnv):
         rng = self.np_random
         for slot, anchor in zip(self._slots, self._source_anchors, strict=True):
             xy = (
-                anchor[0] + float(rng.uniform(-_JITTER, _JITTER)),
-                anchor[1] + float(rng.uniform(-_JITTER, _JITTER)),
+                anchor[0] + float(rng.uniform(-self._layout_jitter, self._layout_jitter)),
+                anchor[1] + float(rng.uniform(-self._layout_jitter, self._layout_jitter)),
             )
             place_freejoint_slot(self.model, self.data, slot, rng, xy)
         for body_id, anchor in zip(self._target_body_ids, self._target_anchors, strict=True):
             self.model.body_pos[body_id] = [
-                anchor[0] + float(rng.uniform(-_JITTER, _JITTER)),
-                anchor[1] + float(rng.uniform(-_JITTER, _JITTER)),
+                anchor[0] + float(rng.uniform(-self._layout_jitter, self._layout_jitter)),
+                anchor[1] + float(rng.uniform(-self._layout_jitter, self._layout_jitter)),
                 _TARGET_Z,
             ]
         self._obj_geom_id = self._slots[self.source_index].geom_id

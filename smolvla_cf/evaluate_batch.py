@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--device", choices=["cuda", "mps", "cpu"], default="cuda")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument("--layout-file", type=Path, help="Saved nominal layouts.json; seeds must match its scene seeds")
     parser.add_argument("--max-replans", type=int, default=30)
     parser.add_argument(
         "--execute-steps",
@@ -40,10 +41,16 @@ def main():
         raise FileExistsError(f"Choose a fresh output directory: {args.output}")
     if len(set(args.seeds)) != len(args.seeds):
         raise ValueError("--seeds must not contain duplicates")
+    layouts_by_seed = {}
+    if args.layout_file is not None:
+        layouts_by_seed = {row["seed"]: row for row in json.loads(args.layout_file.read_text())}
+        if any(seed not in layouts_by_seed for seed in args.seeds):
+            raise ValueError("Every evaluation seed must exist in --layout-file")
     args.output.mkdir(parents=True, exist_ok=True)
 
     run_config = {
         "checkpoint": str(args.checkpoint.resolve()),
+        "layout_file": str(args.layout_file.resolve()) if args.layout_file else None,
         "seeds": args.seeds,
         "max_replans": args.max_replans,
         "execute_steps": args.execute_steps,
@@ -90,6 +97,7 @@ def main():
                             max_replans=args.max_replans, execute_steps=args.execute_steps,
                             interpolation=args.interpolation,
                             spline_fps=args.spline_fps, output=output, env=env,
+                            layout=layouts_by_seed.get(seed),
                         )
                         records.append(record)
                         handle.write(json.dumps(record) + "\n")

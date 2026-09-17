@@ -226,3 +226,102 @@ the validation actually performed.
 
 References: [SmolVLA base](https://huggingface.co/lerobot/smolvla_base),
 [LeRobot SmolVLA](https://github.com/huggingface/lerobot/tree/v0.6.1/src/lerobot/policies/smolvla).
+
+## Nominal-only spatial pretraining (5 train + 2 heldout scenes)
+
+```bash
+source .venv-smolvla/bin/activate
+# On headless Linux, also: export MUJOCO_GL=egl
+python -m cf_data.nominal --workers 4
+bash scripts/train_act_nominal.sh
+```
+
+The first command collects complete oracle demonstrations, then converts them
+into LeRobot v3 with H.264 camera videos at 256x256, 50 Hz and action chunks of 83.
+No counterfactual branches are generated. Raw data goes to `data/nominal_spatial`;
+LeRobot data goes to `data/lerobot_nominal_spatial`. Each scene attempts all 15
+object/goal pairs: up to 75 training and 30 heldout episodes. Failed oracle
+attempts are recorded in `meta/failures.jsonl` and excluded; an empty scene stops
+conversion. Output directories must be fresh.
+
+Seed 42 deterministically generates 7 layouts. All eight coloured entities are
+sampled in world XY (x=0.24..0.40 m, y=-0.17..0.17 m, radius <=0.425 m), with at
+least 7.5 cm between centres. Both objects and goals vary in depth. Between any
+two scenes each same-colour entity moves >=6 cm, mean movement is >=12 cm, and
+symmetric mean nearest-neighbour distance between unlabelled layouts is >=2.5 cm.
+Thus layouts differ in geometry as well as colour assignment. No XY jitter is
+added after choosing a layout. These constraints do not guarantee oracle success;
+check the collection report for actual coverage.
+
+Scene indices 0..4 are `train`, 5..6 are `test` (heldout). The exporter preserves
+these assignments even when episodes fail and computes split-specific action
+and state normalization. Train with `--split train`, **not `--split all`**.
+The ACT script starts a new policy with an ImageNet ResNet18 backbone; it does not
+resume the previous counterfactual checkpoint. The 15-way task conditioning is
+retained so the policy knows which coloured object/goal pair to execute.
+
+For a separate conversion of the raw nominal data:
+
+```bash
+python -m smolvla_cf.export \
+  --source data/nominal_spatial --output data/lerobot_nominal_spatial \
+  --repo-id local/so101_nominal_spatial --nominal-only \
+  --fps 50 --chunk-size 83 --workers 4 --image-storage video
+```
+
+Evaluate a checkpoint on an exact heldout layout (repeat for scene 6 and all
+source/target pairs to measure generalization):
+
+```bash
+python -m smolvla_cf.evaluate \
+  --checkpoint runs/act_nominal_spatial/checkpoint-050000 --device cuda \
+  --layout-file data/lerobot_nominal_spatial/meta/layouts.json --scene-index 5 \
+  --source 0 --target 1 --max-replans 1000 --output outputs/heldout5_red_black.mp4
+```
+
+Five fixed training layouts are a basic pretraining experiment, not evidence of
+broad spatial generalization. Heldout scenes should be used only for evaluation.
+
+## SmolVLA base fine-tuning on nominal spatial data
+
+The nominal dataset above has a dedicated 50 Hz, 50-action export matching the
+pretrained SmolVLA chunk length. The task field is the actual colour instruction
+text, so SmolVLA receives language input rather than ACT's 15-way one-hot.
+Train/heldout scene boundaries and train-only normalization are preserved.
+
+```bash
+source .venv-smolvla/bin/activate
+python -m smolvla_cf.export \
+  --source data/nominal_spatial \
+  --output data/lerobot_nominal_smolvla_50hz \
+  --repo-id local/so101_nominal_smolvla_50hz \
+  --nominal-only --fps 50 --chunk-size 50 \
+  --workers 4 --image-storage video
+bash scripts/train_smolvla_nominal.sh
+```
+
+The training script loads all policy weights from `lerobot/smolvla_base` and
+fine-tunes its action expert and state projection. The pretrained VLM and vision
+encoder stay frozen; add `--train-vlm` to the underlying Python command only if
+an experiment specifically needs text-layer adaptation and can afford the memory.
+On this Mac the script defaults to MPS, batch size 1 and 50,000 updates.
+Pass `cuda` to use a CUDA GPU, batch size 8 and 10,000 updates:
+`bash scripts/train_smolvla_nominal.sh cuda`. Both settings use `--split train`;
+scenes 5 and 6 remain heldout.
+The `--execute-steps 8` setting is a rollout setting in the saved checkpoint.
+The dataset and run output directories must be fresh. A 50k MPS run sees about
+2.3 passes over the 21,419 training frames; a 10k CUDA run at batch size 8 sees
+about 3.7 passes. Evaluate heldout tasks after training.
+
+To evaluate all 30 heldout tasks after training, keep the saved layouts:
+
+```bash
+python -m smolvla_cf.evaluate_batch \
+  --checkpoint runs/smolvla_nominal_spatial_mps/checkpoint-050000 \
+  --device mps --layout-file data/lerobot_nominal_smolvla_50hz/meta/layouts.json \
+  --seeds 47 48 --max-replans 120 --save-videos none \
+  --output outputs/smolvla_nominal_heldout
+```
+
+For the CUDA training script, use its `runs/smolvla_nominal_spatial_cuda`
+checkpoint path and `--device cuda` instead.

@@ -1,4 +1,4 @@
-"""Export full nominal/CF branch trajectories to LeRobot at an exact 30 Hz."""
+"""Export full nominal/CF trajectories to LeRobot at a configurable frame rate."""
 
 from __future__ import annotations
 
@@ -177,12 +177,14 @@ def _build_export_tasks(source_root: Path, anchors: list[dict], nominal_records:
                 "trajectory_path": record["file"],
                 "trajectory_start_frame": 0,
                 "task": record["instruction"],
-                "split": split_for_scene(scene_rank[int(record["scene_index"])], len(scene_indices)),
+                "split": record.get("split", split_for_scene(scene_rank[int(record["scene_index"])], len(scene_indices))),
                 "provenance": {
                     "sample_kind": "nominal",
                     "is_counterfactual": False,
                     "source_episode_id": record["episode_id"],
                     "source_episode_path": record["file"],
+                    "scene_index": record["scene_index"],
+                    "scene_id": record["scene_id"],
                 },
             }
         )
@@ -614,6 +616,7 @@ def export_dataset(
     encoder_threads=4,
     workers=1,
     episodes_per_shard=24,
+    nominal_only=False,
 ):
     source_root = Path(source_root)
     output = Path(output)
@@ -624,7 +627,7 @@ def export_dataset(
     if workers < 1 or encoder_threads < 1 or episodes_per_shard < 1:
         raise ValueError("workers, encoder_threads, and episodes_per_shard must be positive")
     info = json.loads((source_root / "meta/info.json").read_text())
-    anchors = [
+    anchors = [] if nominal_only else [
         json.loads(line)
         for line in (source_root / "meta/anchors.jsonl").read_text().splitlines()
         if line
@@ -635,6 +638,8 @@ def export_dataset(
         if line
     ]
     tasks = _build_export_tasks(source_root, anchors, nominal_records)
+    if any(task["split"] not in ("train", "val", "test") for task in tasks):
+        raise ValueError("Episode split must be train, val, or test")
     if not tasks:
         raise ValueError("No successful nominal or counterfactual trajectories to export")
 
@@ -682,6 +687,22 @@ def export_dataset(
     )
     if temporary_root is not None:
         shutil.rmtree(temporary_root)
+    if (source_root / "meta/layouts.json").exists():
+        shutil.copyfile(source_root / "meta/layouts.json", output / "meta/layouts.json")
+    # LeRobot's native split ranges are episode ranges. Keep them consistent
+    # with our frame manifest when the episodes are grouped by split.
+    split_episodes = {
+        split: [i for i, task in enumerate(tasks) if task["split"] == split]
+        for split in ("train", "val", "test")
+    }
+    split_episodes = {split: indices for split, indices in split_episodes.items() if indices}
+    if all(indices == list(range(indices[0], indices[-1] + 1)) for indices in split_episodes.values()):
+        metadata_path = output / "meta/info.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["splits"] = {
+            split: f"{indices[0]}:{indices[-1] + 1}" for split, indices in split_episodes.items()
+        }
+        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     for result in results:
         local_manifest = Path(result["root"]) / "meta/cf_samples.shard.jsonl"
         if local_manifest != output / "meta/cf_samples.shard.jsonl":
@@ -704,6 +725,7 @@ def main():
     parser.add_argument("--repo-id", default="local/so101_cf")
     parser.add_argument("--chunk-size", type=int, default=50)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--nominal-only", action="store_true", help="Export only complete nominal episodes; no anchors required")
     parser.add_argument("--image-storage", choices=("video", "image"), default="video")
     parser.add_argument(
         "--workers",
@@ -734,6 +756,7 @@ def main():
         encoder_threads=args.encoder_threads,
         workers=args.workers,
         episodes_per_shard=args.episodes_per_shard,
+        nominal_only=args.nominal_only,
     )
 
 

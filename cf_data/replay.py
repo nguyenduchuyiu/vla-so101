@@ -29,6 +29,8 @@ def replay(data_dir: Path, episode_index: int, output: Path | None, settle_steps
     frames = []
     try:
         # Recreate static target body positions, then restore all dynamic state.
+        if "layout" in meta:
+            env.set_layout(meta["layout"])
         scene_seed = int(meta["scene_id"].removeprefix("scene_"))
         env.reset(seed=scene_seed)
         env.set_objective(meta["source_id"], meta["target_id"])

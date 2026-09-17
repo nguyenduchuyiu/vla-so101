@@ -148,6 +148,7 @@ def _collect_scene_worker(
     width: int,
     height: int,
     robot_noise: float,
+    layout: dict | None = None,
 ) -> dict:
     """Collect one scene in an isolated process and write its images locally."""
     scene_out = Path(staging_root) / f"scene-{scene_index:06d}"
@@ -158,6 +159,8 @@ def _collect_scene_worker(
     episodes = []
     failures = []
     try:
+        if layout is not None:
+            env.set_layout(layout)
         env.reset(seed=seed)
         s0 = save_snapshot(env)
         for source_id in range(NUM_OBJECTIVES):
@@ -200,6 +203,7 @@ def _collect_scene_worker(
                             "scene_seed": seed,
                             "initial_state_id": initial_state_id,
                             "scene_index": scene_index,
+                            **({"split": layout["split"], "layout": layout} if layout else {}),
                             "episode_id": ep_id,
                             "objective_id": source_id,
                             "source_id": source_id,
@@ -245,8 +249,10 @@ def collect(args: argparse.Namespace) -> Path:
     if requested_workers < 1:
         raise ValueError("workers must be positive")
     workers = min(requested_workers, args.scenes)
+    layouts = getattr(args, "layouts", None)
     jobs = [
-        (str(staging_root), scene_index, args.seed + scene_index, width, height, args.robot_noise)
+        (str(staging_root), scene_index, args.seed + scene_index, width, height, args.robot_noise,
+         layouts[scene_index] if layouts else None)
         for scene_index in range(args.scenes)
     ]
     if workers == 1:
@@ -316,6 +322,8 @@ def collect(args: argparse.Namespace) -> Path:
         "env_id": ENV_ID,
     }
     (out / "meta" / "info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if layouts is not None:
+        (out / "meta" / "layouts.json").write_text(json.dumps(layouts, indent=2) + "\n")
     print(
         f"saved {len(records)} episodes across {info['num_scenes_saved']} scenes "
         f"({len(failures)} failed objective attempts)"
