@@ -187,6 +187,9 @@ def evaluate_episode(
         actual_rows.append(sim_qpos_to_dataset_row(obs["state"], gripper_limits_rad=limits))
         task = instruction(source, target)
         policy.reset()
+        # Seed once per episode. SmolVLA samples a fresh flow-matching noise
+        # tensor for each chunk; reseeding every replan repeats the same noise.
+        torch.manual_seed(seed)
         absolute_ensembler = (
             ACTTemporalEnsembler(policy.config.temporal_ensemble_coeff, policy.config.chunk_size)
             if temporal_ensemble
@@ -221,7 +224,6 @@ def evaluate_episode(
                 # Do not call ACTPolicy.select_action here. Its built-in temporal
                 # ensemble operates in normalized delta space, but every predicted
                 # chunk is relative to a different current robot state.
-                torch.manual_seed(seed)
                 actions = post(policy.predict_action_chunk(processed))[0].cpu().numpy()
             expected_steps = policy.config.chunk_size
             if actions.shape != (expected_steps, 6) or not np.isfinite(actions).all():
